@@ -1,0 +1,109 @@
+:root {
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: #1c2b4a;
+  background: #f4f6fa;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+button {
+  font: inherit;
+  border: 1px solid #c3cad9;
+  background: #fff;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: #364fc7; color: #364fc7; }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: #364fc7; color: #fff; border-color: #364fc7; }
+input, select { font: inherit; padding: 3px 6px; border: 1px solid #c3cad9; border-radius: 6px; }
+
+.app { display: flex; flex-direction: column; height: 100vh; }
+.toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; background: #fff; border-bottom: 1px solid #dde3ee;
+}
+.app-title { margin-right: 12px; }
+.spacer { flex: 1; }
+.project-name { color: #667085; font-size: 13px; margin-right: 6px; }
+.duration { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.duration input { width: 70px; }
+
+.workspace { flex: 1; display: flex; min-height: 0; }
+.center { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+.viewport {
+  flex: 1; position: relative; margin: 12px; background: #fff;
+  border: 1px solid #dde3ee; border-radius: 10px; overflow: hidden;
+}
+.viewport svg { width: 100%; height: 100%; }
+.bone { cursor: pointer; }
+.bone-label { font-size: 12px; fill: #e8590c; }
+.viewport-controls {
+  position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);
+  display: flex; gap: 8px; align-items: center; background: rgba(255,255,255,0.92);
+  padding: 6px 12px; border-radius: 8px; border: 1px solid #dde3ee; font-size: 13px;
+}
+
+.timeline {
+  background: #fff; border: 1px solid #dde3ee; border-radius: 10px;
+  margin: 0 12px 12px; padding: 10px 14px;
+}
+.timeline-row {
+  position: relative; height: 34px; background: #eef1f7;
+  border-radius: 6px; cursor: pointer; user-select: none;
+}
+.tick {
+  position: absolute; top: 2px; transform: translateX(-50%);
+  font-size: 10px; color: #8a93a6; pointer-events: none;
+}
+.playhead {
+  position: absolute; top: 0; bottom: 0; width: 2px; background: #e8590c;
+  pointer-events: none; z-index: 2;
+}
+.key-dot {
+  position: absolute; top: 50%; transform: translate(-50%, -50%);
+  width: 16px; height: 16px; padding: 0; border-radius: 3px;
+  background: #364fc7; border-color: #23339a; z-index: 3; cursor: grab;
+}
+.key-dot.selected { background: #e8590c; border-color: #a8430a; }
+.timeline-actions {
+  display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 13px;
+}
+.time-readout { margin-left: auto; font-variant-numeric: tabular-nums; }
+.hint { color: #8a93a6; font-size: 12px; }
+.tracks { margin-top: 6px; max-height: 120px; overflow: auto; }
+.track { position: relative; height: 18px; display: flex; align-items: center; }
+.track-name { width: 96px; font-size: 11px; flex-shrink: 0; }
+.track-seg {
+  position: absolute; width: 6px; height: 6px; border-radius: 2px;
+}
+
+.panel {
+  width: 280px; background: #fff; border-left: 1px solid #dde3ee;
+  padding: 14px; overflow: auto;
+}
+.panel h3 { margin: 0 0 10px; font-size: 15px; }
+.bone-tree { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.bone-tree li {
+  padding: 4px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+}
+.bone-tree li:hover { background: #eef1f7; }
+.bone-tree li.active { background: #364fc7; color: #fff; }
+.inspector { margin-top: 14px; border-top: 1px solid #dde3ee; padding-top: 10px; }
+.inspector h4 { margin: 0 0 8px; }
+.inspector label {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; font-size: 12px; margin-bottom: 8px;
+}
+.inspector input { width: 110px; }
+.inspector select { width: 110px; }
+
+.conflict-list { color: #c92a2a; padding-left: 18px; font-size: 13px; line-height: 1.7; }
+
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: #1c2b4a; color: #fff; padding: 8px 18px; border-radius: 8px;
+  font-size: 13px; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+}
