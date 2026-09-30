@@ -6,11 +6,23 @@ export type Bone = {
   rest: { x: number; y: number };
 };
 export type Keyframe = { id: string; time: number; pose: Record<string, Transform> };
+export type Layer = {
+  id: string;
+  name: string;
+  weight: number;
+  start: number;
+  end: number;
+  fade_in: number;
+  fade_out: number;
+  bones: string[];
+  keyframes: Keyframe[];
+};
 export type Project = {
   name: string;
   duration: number;
   skeleton: { bones: Bone[] };
   keyframes: Keyframe[];
+  layers?: Layer[];
 };
 
 export const shortestAngleDelta = (start: number, end: number) =>
@@ -64,30 +76,86 @@ export function validateProject(project: Project): string[] {
       if (!byId.has(boneId)) errors.push(`关键姿态 ${frame.id} 包含未知骨骼 ${boneId}`);
     });
   });
+  project.layers?.forEach((layer, layerIndex) => {
+    const prefix = `第 ${layerIndex + 1} 个动作层`;
+    ["weight", "start", "end", "fade_in", "fade_out"].forEach((field) => {
+      const value = layer[field as keyof Pick<Layer, "weight" | "start" | "end" | "fade_in" | "fade_out">];
+      if (!Number.isFinite(value) || value < 0) errors.push(`${prefix}的 ${field} 必须是非负数字`);
+    });
+    if (layer.weight > 1) errors.push(`${prefix}的权重不能超过 1`);
+    if (layer.start > layer.end) errors.push(`${prefix}的开始时间不能晚于结束时间`);
+    if (layer.start > project.duration || layer.end > project.duration) errors.push(`${prefix}的时间范围超出动画时长`);
+    if (layer.fade_in + layer.fade_out > layer.end - layer.start) errors.push(`${prefix}的淡入淡出总时长不能超过作用时间范围`);
+    if (layer.bones.length === 0) {
+      errors.push(`${prefix}至少选择一根作用骨骼`);
+    } else {
+      layer.bones.forEach((boneId) => {
+        if (!byId.has(boneId)) errors.push(`${prefix}引用了未知骨骼 ${boneId}`);
+      });
+      if (new Set(layer.bones).size !== layer.bones.length) errors.push(`${prefix}的作用骨骼不能重复`);
+    }
+    if (layer.keyframes.length === 0) {
+      errors.push(`${prefix}至少需要一个关键姿态`);
+      return;
+    }
+    const layerTimes = new Set<number>();
+    layer.keyframes.forEach((frame) => {
+      if (!Number.isFinite(frame.time) || frame.time < 0) errors.push(`${prefix}关键姿态 ${frame.id} 时间必须是非负数字`);
+      if (layerTimes.has(frame.time)) errors.push(`${prefix}关键姿态时间不能重复：${frame.time}`);
+      layerTimes.add(frame.time);
+      const allowed = new Set(layer.bones);
+      Object.entries(frame.pose).forEach(([boneId, transform]) => {
+        if (!allowed.has(boneId)) errors.push(`${prefix}关键姿态 ${frame.id} 包含非作用骨骼 ${boneId}`);
+        else if (![transform.x, transform.y, transform.rotation].every(Number.isFinite)) {
+          errors.push(`${prefix}关键姿态 ${frame.id} 中骨骼 ${boneId} 的 x/y/rotation 必须是数字`);
+        }
+      });
+      layer.bones.forEach((boneId) => {
+        if (byId.has(boneId) && !frame.pose[boneId]) errors.push(`${prefix}关键姿态 ${frame.id} 缺少作用骨骼 ${boneId} 的姿态`);
+      });
+    });
+  });
   return errors;
 }
 
 export const orderedKeyframes = (project: Project) =>
   [...project.keyframes].sort((a, b) => a.time - b.time);
 
-export function sampleLocal(project: Project, time: number): Record<string, Transform> {
-  const frames = orderedKeyframes(project);
-  const t = Math.min(Math.max(time, 0), project.duration);
-  if (t <= frames[0].time) return structuredClone(frames[0].pose);
-  if (t >= frames[frames.length - 1].time) return structuredClone(frames[frames.length - 1].pose);
-  let left = frames[0];
-  let right = frames[frames.length - 1];
-  for (let i = 0; i < frames.length - 1; i += 1) {
-    if (frames[i].time <= t && t <= frames[i + 1].time) {
-      left = frames[i];
-      right = frames[i + 1];
+export function layerEnvelope(layer: Layer, time: number): number {
+  if (layer.weight <= 0 || time < layer.start || time > layer.end) return 0;
+  let ramp = 1;
+  if (layer.fade_in > 0 && time < layer.start + layer.fade_in) ramp = (time - layer.start) / layer.fade_in;
+  else if (layer.fade_out > 0 && time > layer.end - layer.fade_out) ramp = (layer.end - time) / layer.fade_out;
+  return Math.max(0, Math.min(1, ramp)) * Math.min(layer.weight, 1);
+}
+
+function blendTransform(base: Transform, overlay: Transform, weight: number): Transform {
+  if (weight <= 0) return { ...base };
+  if (weight >= 1) return { ...overlay };
+  return {
+    x: base.x + (overlay.x - base.x) * weight,
+    y: base.y + (overlay.y - base.y) * weight,
+    rotation: base.rotation + shortestAngleDelta(base.rotation, overlay.rotation) * weight,
+  };
+}
+
+export function sampleFrames(frames: Keyframe[], time: number): Record<string, Transform> {
+  const ordered = [...frames].sort((a, b) => a.time - b.time);
+  if (time <= ordered[0].time) return structuredClone(ordered[0].pose);
+  if (time >= ordered[ordered.length - 1].time) return structuredClone(ordered[ordered.length - 1].pose);
+  let left = ordered[0];
+  let right = ordered[ordered.length - 1];
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    if (ordered[i].time <= time && time <= ordered[i + 1].time) {
+      left = ordered[i];
+      right = ordered[i + 1];
       break;
     }
   }
-  const alpha = right.time === left.time ? 0 : (t - left.time) / (right.time - left.time);
+  const alpha = right.time === left.time ? 0 : (time - left.time) / (right.time - left.time);
   return Object.fromEntries(
     Object.entries(left.pose).map(([boneId, a]) => {
-      const b = right.pose[boneId];
+      const b = right.pose[boneId] ?? a;
       return [boneId, {
         x: a.x + (b.x - a.x) * alpha,
         y: a.y + (b.y - a.y) * alpha,
@@ -95,6 +163,20 @@ export function sampleLocal(project: Project, time: number): Record<string, Tran
       }];
     }),
   );
+}
+
+export function sampleLocal(project: Project, time: number): Record<string, Transform> {
+  const t = Math.min(Math.max(time, 0), project.duration);
+  const result = sampleFrames(project.keyframes, t);
+  (project.layers ?? []).forEach((layer) => {
+    const weight = layerEnvelope(layer, t);
+    if (weight <= 0) return;
+    const overlay = sampleFrames(layer.keyframes, t);
+    layer.bones.forEach((boneId) => {
+      if (result[boneId] && overlay[boneId]) result[boneId] = blendTransform(result[boneId], overlay[boneId], weight);
+    });
+  });
+  return result;
 }
 
 export function boneOrder(project: Project): string[] {
@@ -170,5 +252,39 @@ export function updatePose(project: Project, frameId: string, boneId: string, pa
   const next = cloneProject(project);
   const frame = next.keyframes.find((item) => item.id === frameId);
   if (frame) Object.assign(frame.pose[boneId], patch);
+  return next;
+}
+
+export function updateLayer(project: Project, layerId: string, patch: Partial<Layer>): Project {
+  const next = cloneProject(project);
+  const layer = next.layers?.find((item) => item.id === layerId);
+  if (layer) Object.assign(layer, patch);
+  return next;
+}
+
+export function updateLayerPose(
+  project: Project,
+  layerId: string,
+  frameId: string,
+  boneId: string,
+  patch: Partial<Transform>,
+): Project {
+  const next = cloneProject(project);
+  const frame = next.layers?.find((item) => item.id === layerId)?.keyframes.find((item) => item.id === frameId);
+  if (frame?.pose[boneId]) Object.assign(frame.pose[boneId], patch);
+  return next;
+}
+
+export function addLayerKeyframe(project: Project, layerId: string): Project {
+  const next = cloneProject(project);
+  const layer = next.layers?.find((item) => item.id === layerId);
+  if (!layer || layer.keyframes.length === 0) return next;
+  const ordered = [...layer.keyframes].sort((a, b) => a.time - b.time);
+  const times = ordered.map((frame) => frame.time);
+  const midpoint = (times[0] + times[times.length - 1]) / 2;
+  const candidate = [...times, midpoint, 0, project.duration].sort((a, b) => a - b)
+    .find((value) => times.every((existing) => Math.abs(existing - value) > 1e-6)) ?? midpoint;
+  const pose = Object.fromEntries(layer.bones.map((boneId) => [boneId, { ...(sampleFrames(layer.keyframes, candidate)[boneId]) }]));
+  layer.keyframes.push({ id: `${layerId}-kf-${Date.now()}`, time: candidate, pose });
   return next;
 }

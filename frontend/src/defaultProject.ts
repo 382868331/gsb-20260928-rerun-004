@@ -25,12 +25,29 @@ const makePose = (
   );
 
 export const defaultProject: Project = {
-  name: "简单角色挥手",
+  name: "走路与上半身挥手分层",
   duration: 1.2,
   skeleton: { bones: bones.map((bone) => ({ ...bone })) },
   keyframes: [
     { id: "kf-rest", time: 0, pose: makePose() },
-    { id: "kf-wave", time: 0.6, pose: makePose({ upper_arm_r: 350, forearm_r: -35, head: 8 }) },
-    { id: "kf-end", time: 1.2, pose: makePose({ upper_arm_r: 10 }) },
+    { id: "kf-walk-mid", time: 0.6, pose: makePose({ thigh_l: 18, thigh_r: -18, shin_l: -12, shin_r: 22, spine: -3 }) },
+    { id: "kf-walk-end", time: 1.2, pose: makePose({ thigh_l: -18, thigh_r: 18, shin_l: 22, shin_r: -12, spine: 3 }) },
+  ],
+  layers: [
+    {
+      id: "layer-wave",
+      name: "右手挥手",
+      weight: 1,
+      start: 0.15,
+      end: 1.05,
+      fade_in: 0.2,
+      fade_out: 0.2,
+      bones: ["upper_arm_r", "forearm_r"],
+      keyframes: [
+        { id: "wave-0", time: 0, pose: { upper_arm_r: { x: 22, y: -8, rotation: 350 }, forearm_r: { x: 48, y: 6, rotation: -35 } } },
+        { id: "wave-1", time: 0.3, pose: { upper_arm_r: { x: 22, y: -8, rotation: 15 }, forearm_r: { x: 48, y: 6, rotation: -25 } } },
+        { id: "wave-2", time: 0.6, pose: { upper_arm_r: { x: 22, y: -8, rotation: 355 }, forearm_r: { x: 48, y: 6, rotation: -30 } } },
+      ],
+    },
   ],
 };

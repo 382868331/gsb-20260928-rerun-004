@@ -2,12 +2,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Pause, Play, RotateCcw, Save, TriangleAlert } from "lucide-react";
 import { api } from "./api";
 import {
+  addLayerKeyframe,
   duplicateKeyframe,
   exportAction,
   moveKeyframe,
   orderedKeyframes,
+  updateLayer,
+  updateLayerPose,
   updatePose,
   validateProject,
+  layerEnvelope,
+  sampleLocal,
   type Project,
 } from "./animation";
 import { defaultProject } from "./defaultProject";
@@ -25,6 +30,7 @@ export default function App() {
   const [time, setTime] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [selectedBoneId, setSelectedBoneId] = useState("upper_arm_r");
+  const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
   const [message, setMessage] = useState("已载入内置简单角色；可启动 Python 服务后保存。");
   const [report, setReport] = useState<ConsistencyReport | null>(null);
   const frameRef = useRef<number | null>(null);
@@ -33,8 +39,20 @@ export default function App() {
   const errors = useMemo(() => validateProject(project), [project]);
   const frames = useMemo(() => orderedKeyframes(project), [project]);
   const editingFrame = useMemo(() => nearestEditableFrame(project, time), [project, time]);
+  const activeLayer = useMemo(
+    () => project.layers?.find((layer) => layer.id === activeLayerId) ?? null,
+    [project, activeLayerId],
+  );
+  const layerEditingFrame = useMemo(() => {
+    if (!activeLayer) return null;
+    return [...activeLayer.keyframes].sort((a, b) => Math.abs(a.time - time) - Math.abs(b.time - time))[0];
+  }, [activeLayer, time]);
   const selectedBone = project.skeleton.bones.find((bone) => bone.id === selectedBoneId) ?? project.skeleton.bones[0];
-  const transform = editingFrame?.pose[selectedBone.id];
+  const layerOwnsBone = activeLayer?.bones.includes(selectedBone.id) ?? false;
+  const transform = activeLayer
+    ? (layerOwnsBone ? layerEditingFrame?.pose[selectedBone.id] : undefined)
+    : editingFrame?.pose[selectedBone.id];
+  const layerWeightNow = activeLayer ? layerEnvelope(activeLayer, time) : 0;
 
   useEffect(() => {
     api<{ project: Project }>("/api/project")
@@ -164,29 +182,105 @@ export default function App() {
 
         <aside className="inspector card">
           <h2>姿态编辑</h2>
+          <label>编辑目标
+            <select value={activeLayerId ?? "__base__"} onChange={(event) => setActiveLayerId(event.target.value === "__base__" ? null : event.target.value)}>
+              <option value="__base__">基础动作（全身）</option>
+              {project.layers?.map((layer) => <option key={layer.id} value={layer.id}>{layer.name}</option>)}
+            </select>
+          </label>
           <label>骨骼
-            <select value={selectedBone.id} onChange={(event) => setSelectedBoneId(event.target.value)}>
+            <select value={selectedBone.id} onChange={(event) => setSelectedBoneId(event.target.value)}
+              disabled={!!activeLayer && !layerOwnsBone}>
               {project.skeleton.bones.map((bone) => <option key={bone.id} value={bone.id}>{bone.name}</option>)}
             </select>
           </label>
-          <p className="hint">正在修改最近的关键姿态：<strong>{frames.find((frame) => frame.id === editingFrame.id)?.time.toFixed(2)}s</strong>。旋转父骨骼会驱动所有子骨骼。</p>
+          {activeLayer && !layerOwnsBone && <p className="hint warn">骨骼「{selectedBone.name}」不在层「{activeLayer.name}」的作用范围，该骨骼保持基础动作结果；要编辑请切回基础动作。</p>}
+          {activeLayer && layerOwnsBone && <p className="hint">正在修改层关键姿态：<strong>{layerEditingFrame?.time.toFixed(2)}s</strong>；当前时刻层权重 <strong>{(layerWeightNow * 100).toFixed(0)}%</strong>。仅覆盖层内骨骼的局部姿态，子骨骼再按父子旋转累积。</p>}
+          {!activeLayer && <p className="hint">正在修改最近的关键姿态：<strong>{frames.find((frame) => frame.id === editingFrame.id)?.time.toFixed(2)}s</strong>。旋转父骨骼会驱动所有子骨骼。</p>}
           {transform && <>
             <label>局部 X 坐标
               <input type="range" min="-120" max="120" step="1" value={transform.x}
-                onChange={(event) => commit(updatePose(project, editingFrame.id, selectedBone.id, { x: Number(event.target.value) }))} />
+                onChange={(event) => commit(activeLayer && layerEditingFrame
+                  ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { x: Number(event.target.value) })
+                  : updatePose(project, editingFrame.id, selectedBone.id, { x: Number(event.target.value) }))} />
             </label>
             <label>局部 Y 坐标
               <input type="range" min="-120" max="120" step="1" value={transform.y}
-                onChange={(event) => commit(updatePose(project, editingFrame.id, selectedBone.id, { y: Number(event.target.value) }))} />
+                onChange={(event) => commit(activeLayer && layerEditingFrame
+                  ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { y: Number(event.target.value) })
+                  : updatePose(project, editingFrame.id, selectedBone.id, { y: Number(event.target.value) }))} />
             </label>
             <label>局部旋转
               <input type="range" min="-360" max="360" step="1" value={transform.rotation}
-                onChange={(event) => commit(updatePose(project, editingFrame.id, selectedBone.id, { rotation: Number(event.target.value) }))} />
+                onChange={(event) => commit(activeLayer && layerEditingFrame
+                  ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { rotation: Number(event.target.value) })
+                  : updatePose(project, editingFrame.id, selectedBone.id, { rotation: Number(event.target.value) }))} />
             </label>
             <div className="transform-values"><span>x {transform.x.toFixed(1)}</span><span>y {transform.y.toFixed(1)}</span><span>θ {transform.rotation.toFixed(1)}°</span></div>
           </>}
         </aside>
       </section>
+
+      {project.layers && project.layers.length > 0 && (
+        <section className="layers card">
+          <div className="card-title"><h2>动作分层</h2><span>层在局部姿态空间按权重覆盖作用骨骼，再做父子旋转求值</span></div>
+          {project.layers.map((layer) => {
+            const weightNow = layerEnvelope(layer, time);
+            return <div key={layer.id} className={layer.id === activeLayerId ? "layer-row active" : "layer-row"}>
+              <div className="layer-head">
+                <strong>{layer.name}</strong>
+                <span>当前权重 {(weightNow * 100).toFixed(0)}%</span>
+                <button onClick={() => setActiveLayerId(layer.id === activeLayerId ? null : layer.id)}>
+                  {layer.id === activeLayerId ? "完成编辑" : "编辑此层"}
+                </button>
+                {layer.id === activeLayerId && <button onClick={() => commit(addLayerKeyframe(project, layer.id), "已新增层关键姿态。")}>+ 关键姿态</button>}
+              </div>
+              <div className="layer-controls">
+                <label>权重<input type="number" min={0} max={1} step={0.05} value={layer.weight}
+                  onChange={(event) => commit(updateLayer(project, layer.id, { weight: Number(event.target.value) }), "层权重已更新。")} /></label>
+                <label>开始<input type="number" min={0} max={project.duration} step={0.05} value={layer.start}
+                  onChange={(event) => commit(updateLayer(project, layer.id, { start: Number(event.target.value) }), "层时间范围已更新。")} /></label>
+                <label>结束<input type="number" min={0} max={project.duration} step={0.05} value={layer.end}
+                  onChange={(event) => commit(updateLayer(project, layer.id, { end: Number(event.target.value) }), "层时间范围已更新。")} /></label>
+                <label>淡入<input type="number" min={0} step={0.05} value={layer.fade_in}
+                  onChange={(event) => commit(updateLayer(project, layer.id, { fade_in: Number(event.target.value) }), "淡入时长已更新。")} /></label>
+                <label>淡出<input type="number" min={0} step={0.05} value={layer.fade_out}
+                  onChange={(event) => commit(updateLayer(project, layer.id, { fade_out: Number(event.target.value) }), "淡出时长已更新。")} /></label>
+              </div>
+              <div className="layer-bones">
+                <span>作用骨骼：</span>
+                {project.skeleton.bones.map((bone) => {
+                  const selected = layer.bones.includes(bone.id);
+                  return <button key={bone.id} className={selected ? "chip selected" : "chip"} onClick={() => {
+                    const nextBones = selected ? layer.bones.filter((id) => id !== bone.id) : [...layer.bones, bone.id];
+                    const nextLayer = nextBones.length === 0 ? layer : {
+                      ...layer,
+                      bones: nextBones,
+                      keyframes: layer.keyframes.map((frame) => {
+                        const pose = { ...frame.pose };
+                        if (selected) delete pose[bone.id];
+                        else if (!pose[bone.id]) {
+                          pose[bone.id] = { ...sampleLocal(project, frame.time)[bone.id] };
+                        }
+                        return { ...frame, pose };
+                      }),
+                    };
+                    if (nextBones.length === 0) return;
+                    commit(updateLayer(project, layer.id, nextLayer), selected ? "已移除作用骨骼。" : "已加入作用骨骼，关键姿态以当前混合姿态为初值。");
+                  }}>{bone.name}</button>;
+                })}
+              </div>
+              {layer.id === activeLayerId && <div className="keyframe-list">
+                {[...layer.keyframes].sort((a, b) => a.time - b.time).map((frame) => <div key={frame.id} className="keyframe">
+                  <button onClick={() => { setPlaying(false); setTime(frame.time); }}>{frame.time.toFixed(2)}s</button>
+                  <input type="range" min={0} max={project.duration} step={0.01} value={frame.time}
+                    onChange={(event) => commit(updateLayer(project, layer.id, { keyframes: layer.keyframes.map((item) => item.id === frame.id ? { ...item, time: Number(event.target.value) } : item) }), "层关键姿态已移动。")} />
+                </div>)}
+              </div>}
+            </div>;
+          })}
+        </section>
+      )}
 
       <section className="timeline card">
         <div className="card-title"><h2>关键姿态时间轴</h2><span>移动滑块会同时修改时间；复制会保留完整姿态</span></div>
