@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, evaluateWorld, exportAction, layerEnvelope, sampleLocal, shortestAngleDelta, validateProject } from "./animation";
+import { addLayerKeyframe, actionIsCurrent, consolidateLayers, ConsolidationError, evaluateWorld, exportAction, layerEnvelope, layerWeightAt, resolveAction, sampleLocal, shortestAngleDelta, sourceFingerprint, validateProject } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -102,5 +102,84 @@ describe("animation core", () => {
     const broken = structuredClone(defaultProject);
     broken.skeleton.bones[1].parent = "missing";
     expect(validateProject(broken).join("\n")).toContain("不存在的父骨骼");
+  });
+
+  it("matches the Python source fingerprint byte-for-byte", () => {
+    expect(sourceFingerprint(defaultProject)).toBe("50e12c8e");
+  });
+
+  it("supports smooth weight transitions with reverse scrub and repeat", () => {
+    const layer = {
+      ...defaultProject.layers![0],
+      weight_keyframes: [
+        { time: 0.2, weight: 0, easing: "smooth" as const },
+        { time: 0.6, weight: 1, easing: "smooth" as const },
+      ],
+    };
+    expect(layerWeightAt(layer, 0.2)).toBeCloseTo(0);
+    expect(layerWeightAt(layer, 0.6)).toBeCloseTo(1);
+    const midpoint = layerWeightAt(layer, 0.4);
+    expect(layerWeightAt(layer, 0.4)).toBeCloseTo(midpoint);
+    expect(layerWeightAt(layer, 0.4)).toBeCloseTo(midpoint);
+  });
+
+  it("consolidates layers into an editable action matching the source pose", () => {
+    const source = structuredClone(defaultProject);
+    const before = structuredClone(source.layers);
+    const { project: baked, action } = consolidateLayers(source, {
+      start: 0.2, end: 1, bones: ["upper_arm_r", "forearm_r"], name: "挥手整理",
+    });
+    expect(source.layers).toEqual(before);
+    expect(source.actions).toBeUndefined();
+    expect(actionIsCurrent(baked, action)).toBe(true);
+    expect(resolveAction(baked, action.id)?.id).toBe(action.id);
+    action.keyframes.forEach((frame) => {
+      const expected = sampleLocal(source, frame.time);
+      const actual = sampleLocal(baked, frame.time, action.id);
+      action.bones.forEach((boneId) => {
+        const delta = Math.abs(shortestAngleDelta(expected[boneId].rotation, actual[boneId].rotation));
+        expect(delta).toBeLessThan(1e-8);
+        expect(actual[boneId].x).toBeCloseTo(expected[boneId].x, 10);
+      });
+    });
+    [0, 0.1, 1.05, 1.2].forEach((probe) => {
+      expect(sampleLocal(baked, probe, action.id)).toEqual(sampleLocal(source, probe));
+    });
+    let worst = 0;
+    for (let i = 0; i <= 100; i += 1) {
+      const probe = 0.2 + (0.8 * i) / 100;
+      const expected = sampleLocal(source, probe);
+      const actual = sampleLocal(baked, probe, action.id);
+      action.bones.forEach((boneId) => {
+        worst = Math.max(worst, Math.abs(shortestAngleDelta(expected[boneId].rotation, actual[boneId].rotation)));
+      });
+    }
+    expect(worst).toBeLessThan(0.05);
+    expect(validateProject(baked)).toHaveLength(0);
+  });
+
+  it("rejects missing bones and incompatible layers without partial results", () => {
+    const project = structuredClone(defaultProject);
+    expect(() => consolidateLayers(project, { start: 0, end: 1, bones: ["ghost"] })).toThrow(ConsolidationError);
+    expect(project.actions).toBeUndefined();
+    const broken = structuredClone(defaultProject);
+    delete (broken.layers![0].keyframes[1].pose as Record<string, unknown>).forearm_r;
+    try {
+      consolidateLayers(broken, { start: 0.2, end: 1, bones: ["forearm_r"] });
+      throw new Error("should have rejected");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConsolidationError);
+      expect((error as ConsolidationError).errors.join("\n")).toContain("forearm_r");
+    }
+  });
+
+  it("marks baked actions stale after source keyframes change", () => {
+    const { project: baked, action } = consolidateLayers(structuredClone(defaultProject), {
+      start: 0.2, end: 1, bones: ["upper_arm_r"],
+    });
+    expect(actionIsCurrent(baked, action)).toBe(true);
+    const changed = structuredClone(baked);
+    changed.keyframes[1].pose.spine.rotation = 42;
+    expect(actionIsCurrent(changed, action)).toBe(false);
   });
 });

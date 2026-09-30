@@ -3,12 +3,18 @@ import math
 import unittest
 
 from animation_core import (
+    ConsolidationError,
+    action_is_current,
+    consolidate_layers,
     default_project,
     evaluate_world,
     export_action,
     layer_envelope,
+    layer_weight_at,
+    resolve_action,
     sample_local,
     shortest_angle_delta,
+    source_fingerprint,
     validate_project,
 )
 
@@ -121,6 +127,97 @@ class AnimationCoreTests(unittest.TestCase):
         project["skeleton"]["bones"][2]["parent"] = "head"
         errors = validate_project(project)
         self.assertIn("骨骼 head 不能把自己设为父骨骼", errors)
+
+    def test_weight_keyframes_support_reverse_scrub_and_repeat(self):
+        layer = {
+            "weight": 1.0,
+            "weight_keyframes": [
+                {"time": 0.2, "weight": 0.0, "easing": "smooth"},
+                {"time": 0.6, "weight": 1.0, "easing": "smooth"},
+            ],
+        }
+        self.assertTrue(math.isclose(layer_weight_at(layer, 0.2), 0.0))
+        self.assertTrue(math.isclose(layer_weight_at(layer, 0.6), 1.0))
+        midpoint = layer_weight_at(layer, 0.4)
+        self.assertTrue(0.0 < midpoint < 1.0)
+        self.assertTrue(math.isclose(layer_weight_at(layer, 0.4), midpoint))
+        self.assertTrue(math.isclose(layer_weight_at(layer, 0.4), midpoint))
+        self.assertTrue(math.isclose(layer_weight_at(layer, 0.0), 0.0))
+        self.assertTrue(math.isclose(layer_weight_at(layer, 0.9), 1.0))
+        linear = {
+            "weight": 1.0,
+            "weight_keyframes": [
+                {"time": 0.0, "weight": 0.0, "easing": "linear"},
+                {"time": 1.0, "weight": 1.0, "easing": "linear"},
+            ],
+        }
+        self.assertAlmostEqual(layer_weight_at(linear, 0.25), 0.25)
+
+    def test_consolidate_bakes_matching_pose_without_touching_source(self):
+        project = default_project()
+        before_layers = json.loads(json.dumps(project["layers"]))
+        next_project, action, _ = consolidate_layers(
+            project, 0.2, 1.0, ["upper_arm_r", "forearm_r"], name="挥手整理",
+        )
+        self.assertEqual(project["layers"], before_layers)
+        self.assertNotIn("actions", project)
+        self.assertEqual(action["source_fingerprint"], source_fingerprint(project))
+        self.assertTrue(action_is_current(next_project, action))
+        for frame in action["keyframes"]:
+            expected = sample_local(project, frame["time"])
+            baked = sample_local(next_project, frame["time"], action["id"])
+            for bone_id in action["bones"]:
+                angular_delta = abs((baked[bone_id]["rotation"] - expected[bone_id]["rotation"] + 180.0) % 360.0 - 180.0)
+                self.assertTrue(angular_delta < 1e-9, (frame["time"], bone_id, baked[bone_id]["rotation"], expected[bone_id]["rotation"]))
+                self.assertTrue(math.isclose(baked[bone_id]["x"], expected[bone_id]["x"], abs_tol=1e-9))
+            self.assertAlmostEqual(baked["thigh_l"]["rotation"], expected["thigh_l"]["rotation"])
+        for outside_time in (0.0, 0.19, 1.01, 1.2):
+            expected = sample_local(project, outside_time)
+            baked = sample_local(next_project, outside_time, action["id"])
+            self.assertEqual(baked, expected)
+        self.assertIs(resolve_action(next_project, action["id"]), next_project["actions"][0])
+
+    def test_consolidate_is_exact_through_fades_and_world_evaluation(self):
+        project = default_project()
+        next_project, action, _ = consolidate_layers(project, 0.15, 1.05, ["forearm_r"])
+        for probe in (0.15, 0.25, 0.35, 0.5, 0.95, 1.05):
+            expected_world = evaluate_world(project, probe)
+            baked_world = evaluate_world(next_project, probe, action["id"])
+            self.assertTrue(math.isclose(baked_world["forearm_r"]["rotation"], expected_world["forearm_r"]["rotation"], abs_tol=1e-9))
+
+    def test_consolidate_rejects_missing_bones_and_keeps_project_untouched(self):
+        project = default_project()
+        with self.assertRaises(ConsolidationError) as caught:
+            consolidate_layers(project, 0.0, 1.0, ["upper_arm_r", "ghost"])
+        self.assertTrue(any("ghost" in error for error in caught.exception.errors))
+        self.assertNotIn("actions", project)
+        with self.assertRaises(ConsolidationError):
+            consolidate_layers(project, 0.8, 0.2, ["upper_arm_r"])
+        with self.assertRaises(ConsolidationError):
+            consolidate_layers(project, -0.1, 1.0, ["upper_arm_r"])
+
+    def test_consolidate_reports_incompatible_layer_poses_atomically(self):
+        project = default_project()
+        del project["layers"][0]["keyframes"][1]["pose"]["forearm_r"]
+        with self.assertRaises(ConsolidationError) as caught:
+            consolidate_layers(project, 0.2, 1.0, ["forearm_r"])
+        self.assertTrue(any("forearm_r" in error for error in caught.exception.errors))
+        self.assertNotIn("actions", project)
+
+    def test_fingerprint_distinguishes_source_and_baked_versions(self):
+        project = default_project()
+        next_project, action, _ = consolidate_layers(project, 0.2, 1.0, ["upper_arm_r", "forearm_r"])
+        self.assertTrue(action_is_current(next_project, action))
+        undone = json.loads(json.dumps(next_project))
+        undone["actions"] = []
+        undone["active_action_id"] = None
+        self.assertEqual(undone["layers"], project["layers"])
+        changed = json.loads(json.dumps(next_project))
+        changed["keyframes"][1]["pose"]["spine"]["rotation"] = 42.0
+        self.assertNotEqual(source_fingerprint(changed), action["source_fingerprint"])
+        self.assertFalse(action_is_current(changed, action))
+        reopened = json.loads(json.dumps(next_project))
+        self.assertTrue(action_is_current(reopened, action))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from animation_core import (
+    ConsolidationError,
+    action_is_current,
+    consolidate_layers,
     default_project,
     evaluate_world,
     export_action,
@@ -46,25 +49,29 @@ class AnimationHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/evaluate":
             try:
-                time = float(parse_qs(parsed.query).get("time", ["0"])[0])
+                query = parse_qs(parsed.query)
+                time = float(query.get("time", ["0"])[0])
+                action_id = query.get("action_id", [None])[0]
                 project = load_project(PROJECT_PATH)
                 errors = validate_project(project)
                 if errors:
                     self.end_json({"errors": errors}, HTTPStatus.BAD_REQUEST)
                 else:
-                    self.end_json({"time": time, "local": sample_local(project, time), "world": evaluate_world(project, time)})
+                    self.end_json({"time": time, "local": sample_local(project, time, action_id), "world": evaluate_world(project, time, action_id)})
             except ValueError:
                 self.end_json({"errors": ["time 必须是数字"]}, HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/export":
             try:
-                fps = float(parse_qs(parsed.query).get("fps", ["24"])[0])
+                query = parse_qs(parsed.query)
+                fps = float(query.get("fps", ["24"])[0])
+                action_id = query.get("action_id", [None])[0]
                 project = load_project(PROJECT_PATH)
                 errors = validate_project(project)
                 if errors:
                     self.end_json({"errors": errors}, HTTPStatus.BAD_REQUEST)
                 else:
-                    self.end_json(export_action(project, fps))
+                    self.end_json(export_action(project, fps, action_id))
             except ValueError as exc:
                 self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
             return
@@ -72,6 +79,36 @@ class AnimationHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/api/consolidate":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                project = load_project(PROJECT_PATH)
+                next_project, action, notices = consolidate_layers(
+                    project,
+                    float(payload.get("start")),
+                    float(payload.get("end")),
+                    payload.get("bones"),
+                    name=payload.get("name", "整理动作"),
+                    fps=float(payload.get("fps", 24.0)),
+                    action_id=payload.get("action_id"),
+                )
+                save_project(PROJECT_PATH, next_project)
+                self.end_json({
+                    "ok": True,
+                    "project": next_project,
+                    "action": action,
+                    "notices": notices,
+                    "stale": not action_is_current(next_project, action),
+                    "errors": [],
+                })
+            except ConsolidationError as exc:
+                self.end_json({"errors": exc.errors}, HTTPStatus.BAD_REQUEST)
+            except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+                self.end_json({"errors": ["整理参数无效：需要 start/end 数字和 bones 骨骼数组"]}, HTTPStatus.BAD_REQUEST)
+            except OSError as exc:
+                self.end_json({"errors": [f"保存失败：{exc}"]}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
         if parsed.path != "/api/project":
             self.end_json({"errors": ["接口不存在"]}, HTTPStatus.NOT_FOUND)
             return
