@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, evaluateWorld, exportAction, layerEnvelope, sampleLocal, shortestAngleDelta, validateProject } from "./animation";
+import { addLayerKeyframe, addWeightKey, bakeAction, evaluateWorld, exportAction, layerEnvelope, migrateProject, removeWeightKey, sampleLocal, shortestAngleDelta, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -102,5 +102,62 @@ describe("animation core", () => {
     const broken = structuredClone(defaultProject);
     broken.skeleton.bones[1].parent = "missing";
     expect(validateProject(broken).join("\n")).toContain("不存在的父骨骼");
+  });
+
+  it("interpolates weight keys and reflects mid-transition reversals", () => {
+    let project = addWeightKey(defaultProject, "layer-wave", 0.15, 0);
+    project = addWeightKey(project, "layer-wave", 0.45, 1);
+    project = addWeightKey(project, "layer-wave", 0.75, 0.2);
+    const layer = project.layers![0];
+    expect(weightKeyMultiplier(layer, 0.3)).toBeCloseTo(0.5);
+    expect(weightKeyMultiplier(layer, 0.6)).toBeCloseTo(0.6);
+    const middle = layer.weight_keys!.find((key) => Math.abs(key.time - 0.45) < 1e-9)!;
+    project = updateWeightKey(project, "layer-wave", middle.id, { weight: 0 });
+    expect(weightKeyMultiplier(project.layers![0], 0.3)).toBeCloseTo(0);
+    project = removeWeightKey(project, "layer-wave", middle.id);
+    expect(weightKeyMultiplier(project.layers![0], 0.3)).toBeCloseTo(0.05);
+  });
+
+  it("bakes a range into an editable flat action with provenance", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(defaultProject, 0.2, 1.0, bones, "片段");
+    expect(action.duration).toBeCloseTo(0.8);
+    expect(action.layers).toEqual([]);
+    expect(action.source.source_version).toBe(1);
+    expect(action.source.range_start).toBe(0.2);
+    const projectWithAction = { ...defaultProject, actions: [action] };
+    expect(validateProject(projectWithAction)).toHaveLength(0);
+    for (let i = 0; i <= Math.round(0.8 * 60); i += 1) {
+      const t = Math.min(i / 60, 0.8);
+      const sourcePose = sampleLocal(defaultProject, 0.2 + t);
+      action.keyframes.forEach(() => undefined);
+      const baked = action.keyframes[Math.min(i, action.keyframes.length - 1)].pose;
+      bones.forEach((boneId) => {
+        expect(Math.abs(shortestAngleDelta(baked[boneId].rotation, sourcePose[boneId].rotation))).toBeLessThan(1e-6);
+      });
+    }
+  });
+
+  it("rejects baking with missing bones or partial layers without partial output", () => {
+    expect(() => bakeAction(defaultProject, 0.2, 1.0, ["ghost"], "x")).toThrow("缺失骨骼");
+    expect(() => bakeAction(defaultProject, 0.2, 1.0, ["upper_arm_r"], "x")).toThrow("forearm_r");
+    expect(defaultProject.actions).toEqual([]);
+  });
+
+  it("distinguishes source and baked versions after base edits and migration", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const first = bakeAction(defaultProject, 0, 0.6, bones, "v1").action;
+    const edited: typeof defaultProject = structuredClone(defaultProject);
+    edited.version = 2;
+    edited.keyframes[1].pose.spine.rotation = 9;
+    edited.actions = [first];
+    const second = bakeAction(edited, 0, 0.6, bones, "v2").action;
+    expect(second.source.source_version).toBe(2);
+    expect(first.source.source_version).toBe(1);
+    expect(validateProject({ ...edited, actions: [first, second] })).toHaveLength(0);
+    const legacy = migrateProject(structuredClone(defaultProject) as never);
+    expect(legacy.version).toBe(1);
+    expect(legacy.actions).toEqual([]);
+    expect(legacy.layers?.[0].weight_keys).toEqual([]);
   });
 });

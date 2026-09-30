@@ -1,18 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Pause, Play, RotateCcw, Save, TriangleAlert } from "lucide-react";
+import { Copy, Layers, Pause, Play, Repeat, RotateCcw, Save, Scissors, TriangleAlert } from "lucide-react";
 import { api } from "./api";
 import {
+  addWeightKey,
   addLayerKeyframe,
+  bakeAction,
   duplicateKeyframe,
   exportAction,
+  migrateProject,
   moveKeyframe,
   orderedKeyframes,
+  removeWeightKey,
+  updateWeightKey,
   updateLayer,
   updateLayerPose,
   updatePose,
   validateProject,
   layerEnvelope,
+  weightKeyMultiplier,
   sampleLocal,
+  type Action,
   type Project,
 } from "./animation";
 import { defaultProject } from "./defaultProject";
@@ -29,19 +36,54 @@ export default function App() {
   const [history, setHistory] = useState<Project[]>([]);
   const [time, setTime] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [loopPlay, setLoopPlay] = useState(true);
   const [selectedBoneId, setSelectedBoneId] = useState("upper_arm_r");
   const [activeLayerId, setActiveLayerId] = useState<string | null>(null);
+  const [activeActionId, setActiveActionId] = useState<string>("__main__");
+  const [bakeStart, setBakeStart] = useState(0);
+  const [bakeEnd, setBakeEnd] = useState(1.2);
+  const [bakeBones, setBakeBones] = useState<string[]>([]);
+  const [bakeName, setBakeName] = useState("");
   const [message, setMessage] = useState("已载入内置简单角色；可启动 Python 服务后保存。");
   const [report, setReport] = useState<ConsistencyReport | null>(null);
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
   const errors = useMemo(() => validateProject(project), [project]);
-  const frames = useMemo(() => orderedKeyframes(project), [project]);
-  const editingFrame = useMemo(() => nearestEditableFrame(project, time), [project, time]);
+
+  useEffect(() => {
+    api<{ project: Project }>("/api/project")
+      .then((data) => {
+        const migrated = migrateProject(data.project);
+        setProject(migrated);
+        setHistory([]);
+        setMessage("已从 Python 工程存储载入。");
+      })
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    setBakeEnd(project.duration);
+    if (bakeBones.length === 0) setBakeBones(project.skeleton.bones.map((bone) => bone.id));
+  }, [project.duration]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const activeAction = useMemo(
+    () => (activeActionId === "__main__" ? null : project.actions?.find((action) => action.id === activeActionId) ?? null),
+    [project.actions, activeActionId],
+  );
+  const viewDuration = activeAction?.duration ?? project.duration;
+  const viewProject = useMemo<Project>(() => (activeAction ? {
+    ...project,
+    duration: activeAction.duration,
+    keyframes: activeAction.keyframes,
+    layers: activeAction.layers ?? [],
+  } : project), [project, activeAction]);
+
+  const frames = useMemo(() => orderedKeyframes(viewProject), [viewProject]);
+  const editingFrame = useMemo(() => nearestEditableFrame(viewProject, time), [viewProject, time]);
   const activeLayer = useMemo(
-    () => project.layers?.find((layer) => layer.id === activeLayerId) ?? null,
-    [project, activeLayerId],
+    () => (activeAction ? null : project.layers?.find((layer) => layer.id === activeLayerId) ?? null),
+    [project, activeLayerId, activeAction],
   );
   const layerEditingFrame = useMemo(() => {
     if (!activeLayer) return null;
@@ -54,16 +96,6 @@ export default function App() {
     : editingFrame?.pose[selectedBone.id];
   const layerWeightNow = activeLayer ? layerEnvelope(activeLayer, time) : 0;
 
-  useEffect(() => {
-    api<{ project: Project }>("/api/project")
-      .then((data) => {
-        setProject(data.project);
-        setHistory([]);
-        setMessage("已从 Python 工程存储载入。");
-      })
-      .catch(() => undefined);
-  }, []);
-
   const commit = (next: Project, notice?: string) => {
     if (validateProject(next).length > 0) {
       setMessage("存在骨架冲突，请先修正后再继续编辑。");
@@ -75,15 +107,26 @@ export default function App() {
     setReport(null);
   };
 
+  const commitChange = (nextView: Project, notice?: string) => {
+    if (activeAction) commitAction(nextView, notice);
+    else commitBase(nextView, notice);
+  };
+
   useEffect(() => {
     if (!playing) return;
     startRef.current = { wall: performance.now(), animation: time };
     const tick = (now: number) => {
       const elapsed = (now - startRef.current.wall) / 1000;
       const nextTime = startRef.current.animation + elapsed;
-      if (nextTime >= project.duration) {
-        setTime(0);
-        startRef.current = { wall: performance.now(), animation: 0 };
+      if (nextTime >= viewDuration) {
+        if (loopPlay) {
+          setTime(nextTime % viewDuration);
+          startRef.current = { wall: performance.now(), animation: nextTime % viewDuration };
+        } else {
+          setTime(viewDuration);
+          setPlaying(false);
+          return;
+        }
       } else {
         setTime(nextTime);
       }
@@ -93,7 +136,11 @@ export default function App() {
     return () => {
       if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
     };
-  }, [playing, project.duration]);
+  }, [playing, viewDuration, loopPlay]);
+
+  useEffect(() => {
+    if (time > viewDuration) setTime(viewDuration);
+  }, [viewDuration]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const undo = () => {
     const previous = history.at(-1);
@@ -130,13 +177,70 @@ export default function App() {
   };
 
   const downloadExport = () => {
-    const blob = new Blob([JSON.stringify(exportAction(project, 24), null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(exportAction(viewProject, 24), null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `${project.name || "action"}.json`;
+    link.download = `${activeAction?.name || project.name || "action"}.json`;
     link.click();
     URL.revokeObjectURL(url);
+  };
+
+  const runBake = async () => {
+    try {
+      const result = bakeAction(project, bakeStart, bakeEnd, bakeBones, bakeName);
+      let action = result.action;
+      try {
+        const verified = await api<{ action: Action }>("/api/bake", {
+          method: "POST",
+          body: JSON.stringify({
+            project, range_start: bakeStart, range_end: bakeEnd, bones: bakeBones, name: bakeName,
+          }),
+        });
+        action = { ...verified.action, id: action.id, name: action.name };
+      } catch {
+        setMessage("Python 服务不可用，已使用本地整理结果；保存前请启动后端核对。");
+      }
+      const next: Project = {
+        ...project,
+        actions: [...(project.actions ?? []), action],
+      };
+      if (validateProject(next).length > 0) {
+        setMessage("整理结果未通过校验，已放弃（不提交半份结果）。");
+        return;
+      }
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setActiveActionId(action.id);
+      setTime(0);
+      setReport({ ok: true, message: `已整理新动作「${action.name}」：${action.keyframes.length} 个可编辑关键姿态，源分层工程保持不变。` });
+      setMessage(`整理成功，来源版本 v${action.source.source_version}；范围外动作与源层均未改动。`);
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "整理失败" });
+      setMessage("整理被拒绝：存在未处理内容，工程未被修改。");
+    }
+  };
+
+  const bumpVersionOnEdit = (next: Project): Project => {
+    if (activeActionId !== "__main__") return next;
+    return { ...next, version: next.version + 1 };
+  };
+
+  const commitBase = (next: Project, notice?: string) => commit(bumpVersionOnEdit(next), notice);
+
+  const commitAction = (next: Project, notice?: string) => {
+    if (!activeAction) return;
+    const updatedAction: Action = {
+      ...activeAction,
+      duration: next.duration,
+      keyframes: next.keyframes,
+      layers: next.layers ?? [],
+    };
+    const full: Project = {
+      ...project,
+      actions: (project.actions ?? []).map((item) => (item.id === activeAction.id ? updatedAction : item)),
+    };
+    commit(full, notice);
   };
 
   return (
@@ -162,28 +266,32 @@ export default function App() {
 
       <section className="workspace">
         <div className="stage-card card">
-          <div className="card-title"><h2>任意时刻求值</h2><span>{project.name}</span></div>
-          <SkeletonCanvas project={project} time={time} selectedBoneId={selectedBone.id} onSelectBone={setSelectedBoneId} />
+          <div className="card-title"><h2>任意时刻求值</h2><span>{activeAction ? activeAction.name : project.name}{activeAction && ` · 整理自 v${activeAction.source.source_version}`}</span></div>
+          <SkeletonCanvas project={viewProject} time={time} selectedBoneId={selectedBone.id} onSelectBone={setSelectedBoneId} />
           <div className="transport">
             <button className="play" onClick={() => setPlaying((value) => !value)}>
               {playing ? <Pause size={18} /> : <Play size={18} />}
             </button>
+            <button className={loopPlay ? "loop on" : "loop"} title="重复播放" onClick={() => setLoopPlay((value) => !value)}>
+              <Repeat size={16} />
+            </button>
             <input
               type="range"
               min={0}
-              max={project.duration}
+              max={viewDuration}
               step={0.001}
               value={time}
               onChange={(event) => { setPlaying(false); setTime(Number(event.target.value)); }}
             />
-            <strong>{time.toFixed(3)}s</strong>
+            <strong>{time.toFixed(3)}s / {viewDuration.toFixed(3)}s</strong>
           </div>
         </div>
 
         <aside className="inspector card">
           <h2>姿态编辑</h2>
           <label>编辑目标
-            <select value={activeLayerId ?? "__base__"} onChange={(event) => setActiveLayerId(event.target.value === "__base__" ? null : event.target.value)}>
+            <select value={activeLayerId ?? "__base__"} disabled={!!activeAction}
+              onChange={(event) => setActiveLayerId(event.target.value === "__base__" ? null : event.target.value)}>
               <option value="__base__">基础动作（全身）</option>
               {project.layers?.map((layer) => <option key={layer.id} value={layer.id}>{layer.name}</option>)}
             </select>
@@ -196,34 +304,75 @@ export default function App() {
           </label>
           {activeLayer && !layerOwnsBone && <p className="hint warn">骨骼「{selectedBone.name}」不在层「{activeLayer.name}」的作用范围，该骨骼保持基础动作结果；要编辑请切回基础动作。</p>}
           {activeLayer && layerOwnsBone && <p className="hint">正在修改层关键姿态：<strong>{layerEditingFrame?.time.toFixed(2)}s</strong>；当前时刻层权重 <strong>{(layerWeightNow * 100).toFixed(0)}%</strong>。仅覆盖层内骨骼的局部姿态，子骨骼再按父子旋转累积。</p>}
-          {!activeLayer && <p className="hint">正在修改最近的关键姿态：<strong>{frames.find((frame) => frame.id === editingFrame.id)?.time.toFixed(2)}s</strong>。旋转父骨骼会驱动所有子骨骼。</p>}
+          {!activeLayer && <p className="hint">正在修改{activeAction ? "整理动作" : "最近的关键姿态"}：<strong>{frames.find((frame) => frame.id === editingFrame.id)?.time.toFixed(2)}s</strong>。{activeAction ? "编辑只影响新动作，源分层工程与版本不变。" : "旋转父骨骼会驱动所有子骨骼，保存时源版本递增。"}</p>}
           {transform && <>
             <label>局部 X 坐标
               <input type="range" min="-120" max="120" step="1" value={transform.x}
-                onChange={(event) => commit(activeLayer && layerEditingFrame
+                onChange={(event) => commitChange(activeLayer && layerEditingFrame
                   ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { x: Number(event.target.value) })
-                  : updatePose(project, editingFrame.id, selectedBone.id, { x: Number(event.target.value) }))} />
+                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { x: Number(event.target.value) }))} />
             </label>
             <label>局部 Y 坐标
               <input type="range" min="-120" max="120" step="1" value={transform.y}
-                onChange={(event) => commit(activeLayer && layerEditingFrame
+                onChange={(event) => commitChange(activeLayer && layerEditingFrame
                   ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { y: Number(event.target.value) })
-                  : updatePose(project, editingFrame.id, selectedBone.id, { y: Number(event.target.value) }))} />
+                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { y: Number(event.target.value) }))} />
             </label>
             <label>局部旋转
               <input type="range" min="-360" max="360" step="1" value={transform.rotation}
-                onChange={(event) => commit(activeLayer && layerEditingFrame
+                onChange={(event) => commitChange(activeLayer && layerEditingFrame
                   ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { rotation: Number(event.target.value) })
-                  : updatePose(project, editingFrame.id, selectedBone.id, { rotation: Number(event.target.value) }))} />
+                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { rotation: Number(event.target.value) }))} />
             </label>
             <div className="transform-values"><span>x {transform.x.toFixed(1)}</span><span>y {transform.y.toFixed(1)}</span><span>θ {transform.rotation.toFixed(1)}°</span></div>
           </>}
         </aside>
       </section>
 
-      {project.layers && project.layers.length > 0 && (
+      <section className="actions card">
+        <div className="card-title"><h2>动作库与整理</h2><span>源分层工程与整理后的新动作分开保存，各自带版本溯源</span></div>
+        <div className="action-tabs">
+          <button className={activeActionId === "__main__" ? "chip selected" : "chip"}
+            onClick={() => { setActiveActionId("__main__"); setActiveLayerId(null); setTime(0); }}>
+            <Layers size={14} />源分层工程 v{project.version}
+          </button>
+          {(project.actions ?? []).map((action) => <button key={action.id}
+            className={activeActionId === action.id ? "chip selected" : "chip"}
+            onClick={() => { setActiveActionId(action.id); setActiveLayerId(null); setTime(0); }}>
+            {action.name}（源 v{action.source.source_version}）
+          </button>)}
+        </div>
+        {activeAction && <div className="provenance hint">
+          <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}，
+         时间 {activeAction.source.range_start.toFixed(2)}~{activeAction.source.range_end.toFixed(2)}s，
+         骨骼 {activeAction.source.bones.length} 根，采样 {activeAction.source.fps}fps，
+         生成于 {new Date(activeAction.source.created_at).toLocaleString()}。修改下方关键帧只影响本动作；要随源工程更新请回到源工程修改后重新整理（产生新版本）。
+        </div>}
+        {!activeAction && <div className="bake-panel">
+          <div className="layer-controls">
+            <label>片段开始<input type="number" min={0} max={project.duration} step={0.05} value={bakeStart}
+              onChange={(event) => setBakeStart(Math.min(Number(event.target.value), bakeEnd))} /></label>
+            <label>片段结束<input type="number" min={0} max={project.duration} step={0.05} value={bakeEnd}
+              onChange={(event) => setBakeEnd(Math.max(Number(event.target.value), bakeStart))} /></label>
+            <label>新动作名称<input type="text" value={bakeName} placeholder="如：挥手循环" onChange={(event) => setBakeName(event.target.value)} /></label>
+          </div>
+          <div className="layer-bones">
+            <span>整理骨骼：</span>
+            <button className={bakeBones.length === project.skeleton.bones.length ? "chip selected" : "chip"}
+              onClick={() => setBakeBones(project.skeleton.bones.map((bone) => bone.id))}>全部</button>
+            {project.skeleton.bones.map((bone) => {
+              const selected = bakeBones.includes(bone.id);
+              return <button key={bone.id} className={selected ? "chip selected" : "chip"}
+                onClick={() => setBakeBones((items) => selected ? items.filter((id) => id !== bone.id) : [...items, bone.id])}>{bone.name}</button>;
+            })}
+          </div>
+          <button className="primary bake-btn" onClick={runBake}><Scissors size={15} />整理成新动作（保留源分层工程）</button>
+        </div>}
+      </section>
+
+      {!activeAction && project.layers && project.layers.length > 0 && (
         <section className="layers card">
-          <div className="card-title"><h2>动作分层</h2><span>层在局部姿态空间按权重覆盖作用骨骼，再做父子旋转求值</span></div>
+          <div className="card-title"><h2>动作分层</h2><span>权重关键帧可在过渡中途正反向反复调整</span></div>
           {project.layers.map((layer) => {
             const weightNow = layerEnvelope(layer, time);
             return <div key={layer.id} className={layer.id === activeLayerId ? "layer-row active" : "layer-row"}>
@@ -233,19 +382,31 @@ export default function App() {
                 <button onClick={() => setActiveLayerId(layer.id === activeLayerId ? null : layer.id)}>
                   {layer.id === activeLayerId ? "完成编辑" : "编辑此层"}
                 </button>
-                {layer.id === activeLayerId && <button onClick={() => commit(addLayerKeyframe(project, layer.id), "已新增层关键姿态。")}>+ 关键姿态</button>}
+                {layer.id === activeLayerId && <button onClick={() => commitBase(addLayerKeyframe(project, layer.id), "已新增层关键姿态。")}>+ 关键姿态</button>}
               </div>
               <div className="layer-controls">
                 <label>权重<input type="number" min={0} max={1} step={0.05} value={layer.weight}
-                  onChange={(event) => commit(updateLayer(project, layer.id, { weight: Number(event.target.value) }), "层权重已更新。")} /></label>
+                  onChange={(event) => commitBase(updateLayer(project, layer.id, { weight: Number(event.target.value) }), "层权重已更新。")} /></label>
                 <label>开始<input type="number" min={0} max={project.duration} step={0.05} value={layer.start}
-                  onChange={(event) => commit(updateLayer(project, layer.id, { start: Number(event.target.value) }), "层时间范围已更新。")} /></label>
+                  onChange={(event) => commitBase(updateLayer(project, layer.id, { start: Number(event.target.value) }), "层时间范围已更新。")} /></label>
                 <label>结束<input type="number" min={0} max={project.duration} step={0.05} value={layer.end}
-                  onChange={(event) => commit(updateLayer(project, layer.id, { end: Number(event.target.value) }), "层时间范围已更新。")} /></label>
+                  onChange={(event) => commitBase(updateLayer(project, layer.id, { end: Number(event.target.value) }), "层时间范围已更新。")} /></label>
                 <label>淡入<input type="number" min={0} step={0.05} value={layer.fade_in}
-                  onChange={(event) => commit(updateLayer(project, layer.id, { fade_in: Number(event.target.value) }), "淡入时长已更新。")} /></label>
+                  onChange={(event) => commitBase(updateLayer(project, layer.id, { fade_in: Number(event.target.value) }), "淡入时长已更新。")} /></label>
                 <label>淡出<input type="number" min={0} step={0.05} value={layer.fade_out}
-                  onChange={(event) => commit(updateLayer(project, layer.id, { fade_out: Number(event.target.value) }), "淡出时长已更新。")} /></label>
+                  onChange={(event) => commitBase(updateLayer(project, layer.id, { fade_out: Number(event.target.value) }), "淡出时长已更新。")} /></label>
+              </div>
+              <div className="weight-keys">
+                <span>平滑权重过渡：</span>
+                <button className="chip" onClick={() => commitBase(addWeightKey(project, layer.id, time, weightKeyMultiplier(layer, time)), "已在当前时刻加入权重关键帧。")}>+ 当前时刻 {(weightKeyMultiplier(layer, time) * 100).toFixed(0)}%</button>
+                {[...(layer.weight_keys ?? [])].sort((a, b) => a.time - b.time).map((key) => <span key={key.id} className="weight-key">
+                  <input type="number" min={0} max={project.duration} step={0.01} value={key.time}
+                    onChange={(event) => commitBase(updateWeightKey(project, layer.id, key.id, { time: Number(event.target.value) }), "权重帧时间已更新。")} />
+                  <input type="range" min={0} max={1} step={0.01} value={key.weight}
+                    onChange={(event) => commitBase(updateWeightKey(project, layer.id, key.id, { weight: Number(event.target.value) }), "权重已更新，过渡可中途反向。")} />
+                  <strong>{(key.weight * 100).toFixed(0)}%</strong>
+                  <button onClick={() => commitBase(removeWeightKey(project, layer.id, key.id), "已删除权重关键帧。")}>×</button>
+                </span>)}
               </div>
               <div className="layer-bones">
                 <span>作用骨骼：</span>
@@ -266,7 +427,7 @@ export default function App() {
                       }),
                     };
                     if (nextBones.length === 0) return;
-                    commit(updateLayer(project, layer.id, nextLayer), selected ? "已移除作用骨骼。" : "已加入作用骨骼，关键姿态以当前混合姿态为初值。");
+                    commitBase(updateLayer(project, layer.id, nextLayer), selected ? "已移除作用骨骼。" : "已加入作用骨骼，关键姿态以当前混合姿态为初值。");
                   }}>{bone.name}</button>;
                 })}
               </div>
@@ -274,7 +435,7 @@ export default function App() {
                 {[...layer.keyframes].sort((a, b) => a.time - b.time).map((frame) => <div key={frame.id} className="keyframe">
                   <button onClick={() => { setPlaying(false); setTime(frame.time); }}>{frame.time.toFixed(2)}s</button>
                   <input type="range" min={0} max={project.duration} step={0.01} value={frame.time}
-                    onChange={(event) => commit(updateLayer(project, layer.id, { keyframes: layer.keyframes.map((item) => item.id === frame.id ? { ...item, time: Number(event.target.value) } : item) }), "层关键姿态已移动。")} />
+                    onChange={(event) => commitBase(updateLayer(project, layer.id, { keyframes: layer.keyframes.map((item) => item.id === frame.id ? { ...item, time: Number(event.target.value) } : item) }), "层关键姿态已移动。")} />
                 </div>)}
               </div>}
             </div>;
@@ -283,18 +444,18 @@ export default function App() {
       )}
 
       <section className="timeline card">
-        <div className="card-title"><h2>关键姿态时间轴</h2><span>移动滑块会同时修改时间；复制会保留完整姿态</span></div>
+        <div className="card-title"><h2>{activeAction ? "整理动作关键姿态" : "源工程关键姿态时间轴"}</h2><span>{activeAction ? "逐帧烘焙，可继续编辑；源工程不受影响" : "移动滑块会同时修改时间；复制会保留完整姿态"}</span></div>
         <div className="keyframe-list">
           {frames.map((frame) => <div key={frame.id} className={frame.id === editingFrame.id ? "keyframe active" : "keyframe"}>
             <button onClick={() => { setPlaying(false); setTime(frame.time); }}>{frame.time.toFixed(2)}s</button>
-            <input type="range" min={0} max={project.duration} step={0.01} value={frame.time}
-              onChange={(event) => commit(moveKeyframe(project, frame.id, Number(event.target.value)), "关键姿态已移动。")} />
-            <button title="复制关键姿态" onClick={() => commit(duplicateKeyframe(project, frame.id), "关键姿态已复制。")}><Copy size={15} /></button>
+            <input type="range" min={0} max={viewDuration} step={0.01} value={frame.time}
+              onChange={(event) => commitChange(moveKeyframe(viewProject, frame.id, Number(event.target.value)), "关键姿态已移动。")} />
+            <button title="复制关键姿态" onClick={() => commitChange(duplicateKeyframe(viewProject, frame.id), "关键姿态已复制。")}><Copy size={15} /></button>
           </div>)}
         </div>
         <div className="duration-row">
-          <label>动画时长<input type="number" min={0.1} step={0.1} value={project.duration}
-            onChange={(event) => commit({ ...project, duration: Number(event.target.value) }, "动画时长已更新。")} /></label>
+          {!activeAction && <label>动画时长<input type="number" min={0.1} step={0.1} value={project.duration}
+            onChange={(event) => commitBase({ ...project, duration: Number(event.target.value) }, "动画时长已更新，源版本递增。")} /></label>}
           <p className={report?.ok ? "report ok" : "report warn"}>{report?.message ?? message}</p>
         </div>
       </section>

@@ -1,13 +1,19 @@
 import json
 import math
 import unittest
+from copy import deepcopy
+from pathlib import Path
 
 from animation_core import (
+    bake_action,
     default_project,
     evaluate_world,
     export_action,
     layer_envelope,
+    load_project,
+    migrate_project,
     sample_local,
+    weight_key_multiplier,
     shortest_angle_delta,
     validate_project,
 )
@@ -121,6 +127,86 @@ class AnimationCoreTests(unittest.TestCase):
         project["skeleton"]["bones"][2]["parent"] = "head"
         errors = validate_project(project)
         self.assertIn("骨骼 head 不能把自己设为父骨骼", errors)
+
+    def test_weight_keys_interpolate_and_support_reverse_adjustment(self):
+        project = default_project()
+        layer = project["layers"][0]
+        layer["weight_keys"] = [
+            {"id": "wk-0", "time": 0.15, "weight": 0.0},
+            {"id": "wk-1", "time": 0.45, "weight": 1.0},
+            {"id": "wk-2", "time": 0.75, "weight": 0.2},
+        ]
+        self.assertAlmostEqual(weight_key_multiplier(layer, 0.30), 0.5, places=9)
+        self.assertAlmostEqual(weight_key_multiplier(layer, 0.60), 0.6, places=9)
+        # reverse the key mid-transition: envelope immediately follows new values
+        layer["weight_keys"][1]["weight"] = 0.0
+        self.assertAlmostEqual(weight_key_multiplier(layer, 0.30), 0.0, places=9)
+        bad = deepcopy(project)
+        bad["layers"][0]["weight_keys"] = [{"id": "x", "time": 0.4, "weight": 2.0}]
+        self.assertTrue(any("0~1" in error for error in validate_project(bad)))
+
+    def test_bake_preserves_composed_pose_over_range_and_bones(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        action = bake_action(project, 0.2, 1.0, bone_ids, "片段", action_id="a1")
+        self.assertEqual(validate_project({**project, "actions": [action]}), [])
+        self.assertAlmostEqual(action["duration"], 0.8)
+        self.assertEqual(action["source"]["source_version"], 1)
+        self.assertEqual(action["source"]["range_start"], 0.2)
+        self.assertEqual(action["layers"], [])
+        frame_count = int(round(0.8 * 60)) + 1
+        for index in range(frame_count):
+            source_time = 0.2 + min(index / 60, 0.8)
+            baked_time = min(index / 60, 0.8)
+            source_pose = sample_local(project, source_time)
+            baked_pose = sample_local(action, baked_time)
+            for bone_id in bone_ids:
+                # exact at frame times; tiny linear-interpolation error between them
+                self.assertLessEqual(abs(shortest_angle_delta(baked_pose[bone_id]["rotation"], source_pose[bone_id]["rotation"])), 0.05)
+                self.assertTrue(math.isclose(baked_pose[bone_id]["x"], source_pose[bone_id]["x"], abs_tol=0.05))
+        for index, frame in enumerate(action["keyframes"]):
+            source_pose = sample_local(project, 0.2 + frame["time"])
+            for bone_id in bone_ids:
+                self.assertLessEqual(abs(shortest_angle_delta(frame["pose"][bone_id]["rotation"], source_pose[bone_id]["rotation"])), 1e-7)
+
+    def test_bake_is_rejected_without_partial_result(self):
+        project = default_project()
+        with self.assertRaises(ValueError) as context:
+            bake_action(project, 0.2, 1.0, ["upper_arm_r", "ghost"], "片段", fps=24)
+        self.assertIn("缺失骨骼", str(context.exception))
+        self.assertEqual(project.get("actions", []), [])
+        project["layers"][0]["bones"] = ["upper_arm_r", "forearm_r"]
+        with self.assertRaises(ValueError) as context:
+            bake_action(project, 0.2, 1.0, ["upper_arm_r"], "片段", fps=24)
+        self.assertIn("forearm_r", str(context.exception))
+
+    def test_baked_action_keeps_source_provenance_for_re_baking_and_round_trip(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        first = bake_action(project, 0.0, 0.6, bone_ids, "v1", action_id="a1")
+        project["actions"] = [first]
+        # modify base keyframes, then re-bake: provenance records the new source version
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        second = bake_action(project, 0.0, 0.6, bone_ids, "v2", action_id="a2")
+        self.assertEqual(second["source"]["source_version"], 2)
+        self.assertNotAlmostEqual(
+            second["keyframes"][1]["pose"]["spine"]["rotation"],
+            first["keyframes"][1]["pose"]["spine"]["rotation"],
+        )
+        round_trip = json.loads(json.dumps({**project, "actions": [first, second]}))
+        self.assertEqual(validate_project(round_trip), [])
+
+    def test_load_project_migrates_legacy_fields(self):
+        import tempfile
+        legacy = {"name": "old", "duration": 1.0, "skeleton": default_project()["skeleton"],
+                  "keyframes": deepcopy(default_project()["keyframes"]), "layers": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "project.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = load_project(path)
+            self.assertEqual(loaded["version"], 1)
+            self.assertEqual(loaded["actions"], [])
 
 
 if __name__ == "__main__":

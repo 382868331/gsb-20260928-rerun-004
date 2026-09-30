@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from animation_core import (
+    bake_action,
     default_project,
     evaluate_world,
     export_action,
@@ -72,12 +73,27 @@ class AnimationHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/api/project":
-            self.end_json({"errors": ["接口不存在"]}, HTTPStatus.NOT_FOUND)
-            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            project = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            if parsed.path == "/api/bake":
+                try:
+                    action = bake_action(
+                        payload["project"],
+                        float(payload["range_start"]),
+                        float(payload["range_end"]),
+                        list(payload.get("bones", [])),
+                        str(payload.get("name", "")),
+                        payload.get("action_id"),
+                    )
+                    self.end_json({"ok": True, "action": action})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path != "/api/project":
+                self.end_json({"errors": ["接口不存在"]}, HTTPStatus.NOT_FOUND)
+                return
+            project = payload
             errors = validate_project(project)
             if errors:
                 self.end_json({"errors": errors}, HTTPStatus.BAD_REQUEST)

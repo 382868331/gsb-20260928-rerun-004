@@ -26,6 +26,7 @@ const makePose = (
 
 export const defaultProject: Project = {
   name: "走路与上半身挥手分层",
+  version: 1,
   duration: 1.2,
   skeleton: { bones: bones.map((bone) => ({ ...bone })) },
   keyframes: [
@@ -43,6 +44,7 @@ export const defaultProject: Project = {
       fade_in: 0.2,
       fade_out: 0.2,
       bones: ["upper_arm_r", "forearm_r"],
+      weight_keys: [],
       keyframes: [
         { id: "wave-0", time: 0, pose: { upper_arm_r: { x: 22, y: -8, rotation: 350 }, forearm_r: { x: 48, y: 6, rotation: -35 } } },
         { id: "wave-1", time: 0.3, pose: { upper_arm_r: { x: 22, y: -8, rotation: 15 }, forearm_r: { x: 48, y: 6, rotation: -25 } } },
@@ -50,4 +52,5 @@ export const defaultProject: Project = {
       ],
     },
   ],
+  actions: [],
 };

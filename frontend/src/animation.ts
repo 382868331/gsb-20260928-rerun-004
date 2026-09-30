@@ -15,68 +15,63 @@ export type Layer = {
   fade_in: number;
   fade_out: number;
   bones: string[];
+  weight_keys?: WeightKey[];
   keyframes: Keyframe[];
+};
+export type WeightKey = { id: string; time: number; weight: number };
+export type BakedSource = {
+  action_id: string;
+  source_version: number;
+  range_start: number;
+  range_end: number;
+  bones: string[];
+  fps: number;
+  created_at: string;
+};
+export type Action = {
+  id: string;
+  name: string;
+  duration: number;
+  keyframes: Keyframe[];
+  layers?: Layer[];
+  source: BakedSource;
 };
 export type Project = {
   name: string;
+  version: number;
   duration: number;
   skeleton: { bones: Bone[] };
   keyframes: Keyframe[];
   layers?: Layer[];
+  actions?: Action[];
 };
+export type Clip = Pick<Project, "duration" | "keyframes"> & { layers?: Layer[] };
 
 export const shortestAngleDelta = (start: number, end: number) =>
   ((((end - start) % 360) + 540) % 360) - 180;
 
-export function validateProject(project: Project): string[] {
+export function validateClipContent(clip: { keyframes: Keyframe[]; layers?: Layer[] }, duration: number, bones: Bone[], prefix = ""): string[] {
   const errors: string[] = [];
-  if (!Number.isFinite(project.duration) || project.duration <= 0) errors.push("动画时长必须是正数");
-  const bones = project.skeleton.bones;
-  const byId = new Map<string, Bone>();
-  const roots: string[] = [];
-  bones.forEach((bone, index) => {
-    if (byId.has(bone.id)) errors.push(`骨骼 id 重复：${bone.id}`);
-    else byId.set(bone.id, bone);
-    if (bone.parent === null) roots.push(bone.id);
-    if (bone.parent === bone.id) errors.push(`骨骼 ${bone.id} 不能把自己设为父骨骼`);
-    if (!Number.isFinite(bone.rest.x) || !Number.isFinite(bone.rest.y)) {
-      errors.push(`第 ${index + 1} 根骨骼的静止坐标必须是数字`);
-    }
-  });
-  if (roots.length !== 1) errors.push(`骨架必须恰好有一个根节点，当前有 ${roots.length} 个`);
-  bones.forEach((bone) => {
-    if (bone.parent && !byId.has(bone.parent)) errors.push(`骨骼 ${bone.id} 引用了不存在的父骨骼 ${bone.parent}`);
-    const seen = new Set<string>();
-    let current = bone.parent;
-    while (current) {
-      if (current === bone.id || seen.has(current)) {
-        errors.push(`骨骼层级存在循环：${bone.id}`);
-        break;
-      }
-      seen.add(current);
-      current = byId.get(current)?.parent ?? null;
-    }
-  });
-
-  if (project.keyframes.length === 0) errors.push("至少需要一个关键姿态");
+  const byId = new Map(bones.map((bone) => [bone.id, bone]));
   const times = new Set<number>();
-  project.keyframes.forEach((frame) => {
-    if (!Number.isFinite(frame.time) || frame.time < 0) errors.push(`关键姿态 ${frame.id} 时间必须是非负数字`);
-    if (frame.time > project.duration) errors.push(`关键姿态 ${frame.id} 的时间 ${frame.time} 超出动画时长`);
+  if (clip.keyframes.length === 0) errors.push(`${prefix}至少需要一个关键姿态`);
+  clip.keyframes.forEach((frame) => {
+    if (!Number.isFinite(frame.time) || frame.time < 0) errors.push(`${prefix}关键姿态 ${frame.id} 时间必须是非负数字`);
+    if (frame.time > duration) errors.push(`${prefix}关键姿态 ${frame.id} 的时间 ${frame.time} 超出动作时长`);
     if (times.has(frame.time)) errors.push(`关键姿态时间不能重复：${frame.time}`);
     times.add(frame.time);
     bones.forEach((bone) => {
       const transform = frame.pose[bone.id];
-      if (!transform) errors.push(`关键姿态 ${frame.id} 缺少骨骼 ${bone.id} 的姿态`);
+      if (!transform) errors.push(`${prefix}关键姿态 ${frame.id} 缺少骨骼 ${bone.id} 的姿态`);
       else if (![transform.x, transform.y, transform.rotation].every(Number.isFinite)) {
-        errors.push(`关键姿态 ${frame.id} 中骨骼 ${bone.id} 的 x/y/rotation 必须是数字`);
+        errors.push(`${prefix}关键姿态 ${frame.id} 中骨骼 ${bone.id} 的 x/y/rotation 必须是数字`);
       }
     });
     Object.keys(frame.pose).forEach((boneId) => {
-      if (!byId.has(boneId)) errors.push(`关键姿态 ${frame.id} 包含未知骨骼 ${boneId}`);
+      if (!byId.has(boneId)) errors.push(`${prefix}关键姿态 ${frame.id} 包含未知骨骼 ${boneId}`);
     });
   });
-  project.layers?.forEach((layer, layerIndex) => {
+  clip.layers?.forEach((layer, layerIndex) => {
     const prefix = `第 ${layerIndex + 1} 个动作层`;
     ["weight", "start", "end", "fade_in", "fade_out"].forEach((field) => {
       const value = layer[field as keyof Pick<Layer, "weight" | "start" | "end" | "fade_in" | "fade_out">];
@@ -84,8 +79,20 @@ export function validateProject(project: Project): string[] {
     });
     if (layer.weight > 1) errors.push(`${prefix}的权重不能超过 1`);
     if (layer.start > layer.end) errors.push(`${prefix}的开始时间不能晚于结束时间`);
-    if (layer.start > project.duration || layer.end > project.duration) errors.push(`${prefix}的时间范围超出动画时长`);
+    if (layer.start > duration || layer.end > duration) errors.push(`${prefix}的时间范围超出动作时长`);
     if (layer.fade_in + layer.fade_out > layer.end - layer.start) errors.push(`${prefix}的淡入淡出总时长不能超过作用时间范围`);
+    let lastWeightTime: number | null = null;
+    (layer.weight_keys ?? []).forEach((weightKey, weightIndex) => {
+      const keyPrefix = `${prefix}第 ${weightIndex + 1} 个权重关键帧`;
+      if (!Number.isFinite(weightKey.time) || weightKey.time < 0 || weightKey.time > duration) {
+        errors.push(`${keyPrefix}的时间必须在动作时长内`);
+      }
+      if (!Number.isFinite(weightKey.weight) || weightKey.weight < 0 || weightKey.weight > 1) {
+        errors.push(`${keyPrefix}的权重必须在 0~1 之间`);
+      }
+      if (lastWeightTime !== null && weightKey.time <= lastWeightTime) errors.push(`${prefix}的权重关键帧时间必须严格递增`);
+      lastWeightTime = weightKey.time;
+    });
     if (layer.bones.length === 0) {
       errors.push(`${prefix}至少选择一根作用骨骼`);
     } else {
@@ -118,15 +125,85 @@ export function validateProject(project: Project): string[] {
   return errors;
 }
 
+export function validateProject(project: Project): string[] {
+  const errors: string[] = [];
+  if (!Number.isFinite(project.duration) || project.duration <= 0) errors.push("动画时长必须是正数");
+  const bones = project.skeleton.bones;
+  const byId = new Map<string, Bone>();
+  const roots: string[] = [];
+  bones.forEach((bone, index) => {
+    if (byId.has(bone.id)) errors.push(`骨骼 id 重复：${bone.id}`);
+    else byId.set(bone.id, bone);
+    if (bone.parent === null) roots.push(bone.id);
+    if (bone.parent === bone.id) errors.push(`骨骼 ${bone.id} 不能把自己设为父骨骼`);
+    if (!Number.isFinite(bone.rest.x) || !Number.isFinite(bone.rest.y)) {
+      errors.push(`第 ${index + 1} 根骨骼的静止坐标必须是数字`);
+    }
+  });
+  if (roots.length !== 1) errors.push(`骨架必须恰好有一个根节点，当前有 ${roots.length} 个`);
+  bones.forEach((bone) => {
+    if (bone.parent && !byId.has(bone.parent)) errors.push(`骨骼 ${bone.id} 引用了不存在的父骨骼 ${bone.parent}`);
+    const seen = new Set<string>();
+    let current = bone.parent;
+    while (current) {
+      if (current === bone.id || seen.has(current)) {
+        errors.push(`骨骼层级存在循环：${bone.id}`);
+        break;
+      }
+      seen.add(current);
+      current = byId.get(current)?.parent ?? null;
+    }
+  });
+  if (!Number.isInteger(project.version) || project.version < 1) errors.push("工程版本号必须是正整数");
+
+  errors.push(...validateClipContent(project, project.duration, bones));
+
+  const actionIds = new Set<string>();
+  (project.actions ?? []).forEach((action, actionIndex) => {
+    const prefix = `第 ${actionIndex + 1} 个整理动作`;
+    if (actionIds.has(action.id)) errors.push(`${prefix}id 重复：${action.id}`);
+    actionIds.add(action.id);
+    if (!Number.isFinite(action.duration) || action.duration <= 0) {
+      errors.push(`${prefix}的时长必须是正数`);
+      return;
+    }
+    const source = action.source;
+    if (!source || !source.action_id) errors.push(`${prefix}缺少来源动作 id（源工程为 __main__）`);
+    if (!source || !Number.isInteger(source.source_version) || source.source_version < 1) errors.push(`${prefix}缺少来源版本号`);
+    if (!source || !(source.range_end > source.range_start)) errors.push(`${prefix}的整理时间范围无效`);
+    if (!source?.bones.length) errors.push(`${prefix}缺少整理骨骼范围`);
+    else source.bones.forEach((boneId) => {
+      if (!byId.has(boneId)) errors.push(`${prefix}的整理骨骼范围包含未知骨骼 ${boneId}`);
+    });
+    errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`));
+  });
+  return errors;
+}
+
 export const orderedKeyframes = (project: Project) =>
   [...project.keyframes].sort((a, b) => a.time - b.time);
+
+export function weightKeyMultiplier(layer: Layer, time: number): number {
+  const keys = [...(layer.weight_keys ?? [])].sort((a, b) => a.time - b.time);
+  if (keys.length === 0) return 1;
+  if (time <= keys[0].time) return Math.max(0, Math.min(1, keys[0].weight));
+  if (time >= keys[keys.length - 1].time) return Math.max(0, Math.min(1, keys[keys.length - 1].weight));
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    if (keys[i].time <= time && time <= keys[i + 1].time) {
+      const span = keys[i + 1].time - keys[i].time;
+      const alpha = span === 0 ? 0 : (time - keys[i].time) / span;
+      return Math.max(0, Math.min(1, keys[i].weight + (keys[i + 1].weight - keys[i].weight) * alpha));
+    }
+  }
+  return 1;
+}
 
 export function layerEnvelope(layer: Layer, time: number): number {
   if (layer.weight <= 0 || time < layer.start || time > layer.end) return 0;
   let ramp = 1;
   if (layer.fade_in > 0 && time < layer.start + layer.fade_in) ramp = (time - layer.start) / layer.fade_in;
   else if (layer.fade_out > 0 && time > layer.end - layer.fade_out) ramp = (layer.end - time) / layer.fade_out;
-  return Math.max(0, Math.min(1, ramp)) * Math.min(layer.weight, 1);
+  return Math.max(0, Math.min(1, ramp)) * Math.min(layer.weight, 1) * weightKeyMultiplier(layer, time);
 }
 
 function blendTransform(base: Transform, overlay: Transform, weight: number): Transform {
@@ -230,6 +307,138 @@ export function exportAction(project: Project, fps = 24) {
 }
 
 export const cloneProject = (project: Project): Project => structuredClone(project);
+
+const poseClose = (a: Record<string, Transform>, b: Record<string, Transform>, tolerance: number) => {
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every((boneId) =>
+    Math.abs(a[boneId].x - b[boneId].x) <= tolerance
+    && Math.abs(a[boneId].y - b[boneId].y) <= tolerance
+    && Math.abs(shortestAngleDelta(a[boneId].rotation, b[boneId].rotation)) <= tolerance);
+};
+
+export type BakeResult = { action: Action; warnings: string[] };
+
+export function bakeAction(
+  project: Project,
+  rangeStart: number,
+  rangeEnd: number,
+  boneIds: string[],
+  name: string,
+  fps = 60,
+): BakeResult {
+  const problems: string[] = [];
+  if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd)
+      || rangeStart < 0 || rangeEnd > project.duration || rangeEnd <= rangeStart) {
+    problems.push(`整理时间范围 ${rangeStart}~${rangeEnd}s 无效或超出工程时长 ${project.duration}s`);
+  }
+  const knownBones = new Set(project.skeleton.bones.map((bone) => bone.id));
+  const selectedBones = [...new Set(boneIds)];
+  const missing = selectedBones.filter((boneId) => !knownBones.has(boneId));
+  if (missing.length) problems.push("缺失骨骼，未处理：" + missing.join("、"));
+  if (!selectedBones.some((boneId) => knownBones.has(boneId))) problems.push("骨骼范围为空，无法整理");
+  const validationErrors = validateProject(project);
+  if (validationErrors.length) problems.push(...validationErrors.map((error) => `工程存在未解决冲突：${error}`));
+  if (problems.length) throw new Error(problems.join("；"));
+
+  const warnings: string[] = [];
+  const selected = new Set(selectedBones);
+  (project.layers ?? []).forEach((layer) => {
+    const overlaps = Math.min(layer.end, rangeEnd) - Math.max(layer.start, rangeStart);
+    if (overlaps <= 0) return;
+    const covered = new Set(layer.bones.filter((boneId) => selected.has(boneId)));
+    const uncovered = layer.bones.filter((boneId) => !selected.has(boneId));
+    if (covered.size > 0 && uncovered.length > 0) {
+      warnings.push(`层「${layer.name}」在范围内只选择了部分作用骨骼，已覆盖 ${uncovered.join("、")}，未处理`);
+    }
+    const changingKeys = (layer.weight_keys ?? []).filter((key) => key.time > rangeStart && key.time < rangeEnd);
+    if (changingKeys.length > 0 && layer.weight > 0) {
+      warnings.push(`层「${layer.name}」在整理范围内包含 ${changingKeys.length} 个权重过渡关键帧，烘焙会固化过渡，如需继续反向调整请先取消权重关键帧`);
+    }
+  });
+  if (warnings.length) throw new Error(warnings.join("；"));
+
+  const span = rangeEnd - rangeStart;
+  const count = Math.round(span * fps) + 1;
+  const keyframes: Keyframe[] = [];
+  let previous: Record<string, Transform> | null = null;
+  for (let index = 0; index < count; index += 1) {
+    const sourceTime = rangeStart + Math.min(index / fps, span);
+    const pose = sampleLocal(project, sourceTime);
+    const selectedPose = Object.fromEntries(selectedBones.map((boneId) => [boneId, { ...pose[boneId] }]));
+    if (previous && poseClose(previous, selectedPose, 1e-7) && keyframes.length >= 2) {
+      keyframes[keyframes.length - 1].time = Math.round((sourceTime - rangeStart) * 1e9) / 1e9;
+    } else {
+      keyframes.push({
+        id: `baked-kf-${keyframes.length}`,
+        time: Math.round((sourceTime - rangeStart) * 1e9) / 1e9,
+        pose: selectedPose,
+      });
+    }
+    previous = selectedPose;
+  }
+  keyframes[keyframes.length - 1].time = span;
+
+  const id = `action-${(project.actions ?? []).length + 1}-${Math.round(rangeStart * 1000)}-${Math.round(rangeEnd * 1000)}`;
+  const action: Action = {
+    id,
+    name: name || `整理动作 ${rangeStart}~${rangeEnd}s`,
+    duration: span,
+    keyframes,
+    layers: [],
+    source: {
+      action_id: "__main__",
+      source_version: project.version,
+      range_start: rangeStart,
+      range_end: rangeEnd,
+      bones: selectedBones,
+      fps,
+      created_at: new Date().toISOString(),
+    },
+  };
+  for (let index = 0; index < count; index += 1) {
+    const sourceTime = rangeStart + Math.min(index / fps, span);
+    const sourcePose = sampleLocal(project, sourceTime);
+    const bakedPose = keyframes[Math.min(index, keyframes.length - 1)].pose;
+    selectedBones.forEach((boneId) => {
+      if (Math.abs(shortestAngleDelta(bakedPose[boneId].rotation, sourcePose[boneId].rotation)) > 1e-7) {
+        throw new Error(`整理结果在 ${sourceTime}s 的骨骼 ${boneId} 与原工程姿态不一致，已放弃整理`);
+      }
+    });
+  }
+  return { action, warnings };
+}
+
+export function migrateProject(project: Project): Project {
+  const next = structuredClone(project);
+  if (!Number.isInteger(next.version)) next.version = 1;
+  if (!next.actions) next.actions = [];
+  (next.layers ?? []).forEach((layer) => { if (!layer.weight_keys) layer.weight_keys = []; });
+  return next;
+}
+
+export function addWeightKey(project: Project, layerId: string, time: number, weight: number): Project {
+  const next = cloneProject(project);
+  const layer = next.layers?.find((item) => item.id === layerId);
+  if (!layer) return next;
+  layer.weight_keys = [...(layer.weight_keys ?? []), { id: `wk-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, time, weight }]
+    .sort((a, b) => a.time - b.time);
+  return next;
+}
+
+export function updateWeightKey(project: Project, layerId: string, keyId: string, patch: Partial<{ time: number; weight: number }>): Project {
+  const next = cloneProject(project);
+  const key = next.layers?.find((item) => item.id === layerId)?.weight_keys?.find((item) => item.id === keyId);
+  if (key) Object.assign(key, patch);
+  return next;
+}
+
+export function removeWeightKey(project: Project, layerId: string, keyId: string): Project {
+  const next = cloneProject(project);
+  const layer = next.layers?.find((item) => item.id === layerId);
+  if (layer?.weight_keys) layer.weight_keys = layer.weight_keys.filter((item) => item.id !== keyId);
+  return next;
+}
 
 export function moveKeyframe(project: Project, keyframeId: string, time: number): Project {
   const next = cloneProject(project);
