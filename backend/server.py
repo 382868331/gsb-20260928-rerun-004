@@ -13,6 +13,9 @@ from animation_core import (
     evaluate_world,
     export_action,
     load_project,
+    apply_rework,
+    revert_rework,
+    rework_analysis,
     sample_local,
     save_project,
     validate_project,
@@ -87,6 +90,32 @@ class AnimationHandler(BaseHTTPRequestHandler):
                         payload.get("action_id"),
                     )
                     self.end_json({"ok": True, "action": action})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/rework/analyze":
+                try:
+                    result = rework_analysis(payload["project"], str(payload["action_id"]))
+                    self.end_json({"ok": True, **result})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/rework/apply":
+                try:
+                    result = apply_rework(
+                        payload["project"],
+                        str(payload["action_id"]),
+                        list(payload["segment_ids"]) if payload.get("segment_ids") is not None else None,
+                        payload.get("decisions") if isinstance(payload.get("decisions"), dict) else None,
+                    )
+                    self.end_json({"ok": True, **result})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/rework/revert":
+                try:
+                    result = revert_rework(payload["project"], str(payload["action_id"]), str(payload["repair_id"]))
+                    self.end_json({"ok": True, **result})
                 except (KeyError, TypeError, ValueError) as exc:
                     self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
                 return

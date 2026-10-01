@@ -92,3 +92,15 @@ select, input[type="number"] { border: 1px solid #d3dcea; border-radius: 9px; pa
 .weight-key { display: inline-flex; align-items: center; gap: 4px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 999px; padding: 2px 8px; }
 .weight-key input[type="number"] { width: 64px; }
 .weight-key input[type="range"] { width: 90px; }
+
+.rework-panel { display: grid; gap: 10px; }
+.rework-report { display: grid; gap: 8px; border: 1px solid #e1e7f0; border-radius: 12px; background: #fbfcff; padding: 12px; }
+.rework-segment { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; border: 1px solid #e2e8f0; border-radius: 10px; padding: 8px 10px; background: #fff; }
+.rework-segment .seg-toggle { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; font-size: 13px; }
+.rework-segment .warn { color: #8a5012; font-size: 12px; font-weight: 700; }
+.rework-segment details { flex-basis: 100%; }
+.rework-frames { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; margin-top: 6px; }
+.rework-frames label { display: flex; align-items: center; gap: 8px; font-size: 12px; border: 1px solid #eef2f7; border-radius: 8px; padding: 4px 8px; }
+.rework-frames label.manual-frame { border-color: #e7c48d; background: #fffaf0; }
+.rework-history { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; color: #526078; }
+.manual-tag { font-style: normal; font-size: 10px; color: #8a5012; border: 1px solid #e7c48d; background: #fff6e7; border-radius: 999px; padding: 1px 6px; margin-left: 4px; }

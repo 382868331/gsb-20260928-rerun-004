@@ -5,13 +5,17 @@ from copy import deepcopy
 from pathlib import Path
 
 from animation_core import (
+    apply_rework,
     bake_action,
     default_project,
     evaluate_world,
     export_action,
     layer_envelope,
     load_project,
+    mark_frame_manual,
     migrate_project,
+    rework_analysis,
+    revert_rework,
     sample_local,
     weight_key_multiplier,
     shortest_angle_delta,
@@ -205,8 +209,91 @@ class AnimationCoreTests(unittest.TestCase):
             path = Path(directory) / "project.json"
             path.write_text(json.dumps(legacy), encoding="utf-8")
             loaded = load_project(path)
-            self.assertEqual(loaded["version"], 1)
-            self.assertEqual(loaded["actions"], [])
+        self.assertEqual(loaded["version"], 1)
+        self.assertEqual(loaded["actions"], [])
+
+    def test_bake_accepts_smooth_three_key_weight_transition(self):
+        project = default_project()
+        layer = project["layers"][0]
+        layer["weight_keys"] = [
+            {"id": "wk-0", "time": 0.15, "weight": 0.0},
+            {"id": "wk-1", "time": 0.45, "weight": 1.0},
+            {"id": "wk-2", "time": 0.75, "weight": 0.2},
+        ]
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        action = bake_action(project, 0.2, 1.0, bone_ids, "片段", action_id="a1")
+        self.assertEqual(action["source"]["baked_version"], 1)
+        count = round(0.8 * 60) + 1
+        for index in range(count):
+            sample_time = round(0.2 + min(index / 60, 0.8), 9)
+            local_time = round(sample_time - 0.2, 9)
+            frame = min(action["keyframes"], key=lambda item: abs(item["time"] - local_time))
+            source_pose = sample_local(project, sample_time)
+            for bone_id in bone_ids:
+                self.assertLessEqual(abs(shortest_angle_delta(
+                    frame["pose"][bone_id]["rotation"], source_pose[bone_id]["rotation"],
+                )), 1e-6)
+                self.assertAlmostEqual(frame["pose"][bone_id]["x"], source_pose[bone_id]["x"], places=6)
+                self.assertAlmostEqual(frame["pose"][bone_id]["y"], source_pose[bone_id]["y"], places=6)
+
+    def test_partial_bone_bake_is_supported(self):
+        project = default_project()
+        action = bake_action(project, 0.0, 0.6, ["upper_arm_r", "forearm_r"], "手臂", action_id="arm")
+        bundled = {**project, "actions": [action]}
+        self.assertEqual(validate_project(bundled), [])
+
+    def test_rework_reports_ranges_preserves_manual_and_reverts_independently(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        action = bake_action(project, 0.0, 1.2, bone_ids, "全片段", action_id="a1")
+        project["actions"] = [action]
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        first = apply_rework(project, "a1")
+        self.assertTrue(first["archived_action_id"].endswith("-v1"))
+        self.assertGreaterEqual(len(first["updated_frames"]), 1)
+
+        frame = action["keyframes"][round(0.31 * 60)]
+        frame["pose"]["spine"]["rotation"] = 77.0
+        mark_frame_manual(frame, ["spine"])
+        project["version"] = 3
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 12.0
+
+        analysis = rework_analysis(project, "a1")
+        self.assertTrue(any(segment["has_manual"] for segment in analysis["segments"]))
+        second = apply_rework(project, "a1")
+        self.assertIn(frame["id"], second["kept_manual_frames"])
+        self.assertEqual(frame["pose"]["spine"]["rotation"], 77.0)
+        self.assertEqual(frame["manual_bones"], ["spine"])
+
+        manual_segment = next(segment["id"] for segment in analysis["segments"] if frame["id"] in segment["manual_frame_ids"])
+        third = apply_rework(project, "a1", [manual_segment], {frame["id"]: "source"})
+        self.assertNotAlmostEqual(frame["pose"]["spine"]["rotation"], 77.0)
+        self.assertEqual(frame["manual_bones"], [])
+
+        latest_id = action["rework_history"][-1]["id"]
+        revert_rework(project, "a1", latest_id)
+        self.assertEqual(frame["pose"]["spine"]["rotation"], 77.0)
+        first_id = action["rework_history"][0]["id"]
+        revert_rework(project, "a1", first_id)
+        self.assertEqual(frame["pose"]["spine"]["rotation"], 77.0)
+        self.assertEqual(validate_project(project), [])
+        archive = next(item for item in project["actions"] if item.get("readonly"))
+        self.assertEqual(archive["source"]["archive_of"], "a1")
+
+    def test_rework_failure_keeps_layer_project_intact(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        action = bake_action(project, 0.0, 1.2, bone_ids, "全片段", action_id="a1")
+        action_id_before = id(action)
+        project["actions"] = [action]
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        project["skeleton"]["bones"][1]["parent"] = "ghost"
+        with self.assertRaises(ValueError):
+            apply_rework(project, "a1")
+        self.assertEqual(len(project["actions"]), 1)
+        self.assertEqual(id(project["actions"][0]), action_id_before)
 
 
 if __name__ == "__main__":

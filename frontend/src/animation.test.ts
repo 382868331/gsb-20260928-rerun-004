@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, addWeightKey, bakeAction, evaluateWorld, exportAction, layerEnvelope, migrateProject, removeWeightKey, sampleLocal, shortestAngleDelta, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
+import { addLayerKeyframe, addWeightKey, applyRework, bakeAction, evaluateWorld, exportAction, layerEnvelope, markFrameManual, migrateProject, removeWeightKey, revertRework, reworkAnalysis, sampleLocal, shortestAngleDelta, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -159,5 +159,62 @@ describe("animation core", () => {
     expect(legacy.version).toBe(1);
     expect(legacy.actions).toEqual([]);
     expect(legacy.layers?.[0].weight_keys).toEqual([]);
+  });
+
+  it("bakes smooth three-key weight transitions instead of rejecting them", () => {
+    let project = addWeightKey(defaultProject, "layer-wave", 0.15, 0);
+    project = addWeightKey(project, "layer-wave", 0.45, 1);
+    project = addWeightKey(project, "layer-wave", 0.75, 0.2);
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action, warnings } = bakeAction(project, 0.2, 1.0, bones, "片段");
+    expect(warnings).toEqual([]);
+    action.keyframes.forEach((frame) => {
+      const sourcePose = sampleLocal(project, 0.2 + frame.time);
+      bones.forEach((boneId) => {
+        expect(Math.abs(shortestAngleDelta(frame.pose[boneId].rotation, sourcePose[boneId].rotation))).toBeLessThan(1e-6);
+        expect(frame.pose[boneId].x).toBeCloseTo(sourcePose[boneId].x, 6);
+        expect(frame.pose[boneId].y).toBeCloseTo(sourcePose[boneId].y, 6);
+      });
+    });
+  });
+
+  it("analyzes source revisions, preserves manual frames and reverts one decision at a time", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const baked = bakeAction(defaultProject, 0, 1.2, bones, "全片段").action;
+    let project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [baked] };
+    project.version = 2;
+    project.keyframes[1].pose.spine.rotation = 9;
+    const first = applyRework(project, "action-1-0-1200");
+    expect(first.archived_action_id).toContain("-v1");
+    project = first.project;
+    const action = project.actions!.find((item) => item.id === baked.id)!;
+    const frame = action.keyframes[Math.round(0.31 * 60)];
+    frame.pose.spine.rotation = 77;
+    markFrameManual(frame, ["spine"]);
+    project.version = 3;
+    project.keyframes[1].pose.spine.rotation = 12;
+    const analysis = reworkAnalysis(project, action.id);
+    expect(analysis.segments.some((segment) => segment.has_manual)).toBe(true);
+    const second = applyRework(project, action.id);
+    project = second.project;
+    expect(second.kept_manual_frames).toContain(frame.id);
+    const manualAfter = project.actions!.find((item) => item.id === action.id)!.keyframes.find((item) => item.id === frame.id)!;
+    expect(manualAfter.pose.spine.rotation).toBe(77);
+    expect(manualAfter.manual_bones).toContain("spine");
+    const manualSegment = analysis.segments.find((segment) => segment.manual_frame_ids.includes(frame.id))!;
+    const adopted = applyRework(project, action.id, [manualSegment.id], { [frame.id]: "source" });
+    project = adopted.project;
+    const adoptedFrame = project.actions!.find((item) => item.id === action.id)!.keyframes.find((item) => item.id === frame.id)!;
+    expect(adoptedFrame.pose.spine.rotation).not.toBe(77);
+    expect(adoptedFrame.manual_bones).toEqual([]);
+    project = revertRework(project, action.id, adopted.action.rework_history!.at(-1)!.id);
+    const restoredFrame = project.actions!.find((item) => item.id === action.id)!.keyframes.find((item) => item.id === frame.id)!;
+    expect(restoredFrame.pose.spine.rotation).toBe(77);
+    project = revertRework(project, action.id, project.actions!.find((item) => item.id === action.id)!.rework_history![0].id);
+    const stillManual = project.actions!.find((item) => item.id === action.id)!.keyframes.find((item) => item.id === frame.id)!;
+    expect(stillManual.pose.spine.rotation).toBe(77);
+    expect(validateProject(project)).toHaveLength(0);
+    const archive = project.actions!.find((item) => item.readonly);
+    expect(archive?.source.archive_of).toBe(action.id);
   });
 });

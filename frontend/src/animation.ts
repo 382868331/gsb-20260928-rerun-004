@@ -5,7 +5,15 @@ export type Bone = {
   parent: string | null;
   rest: { x: number; y: number };
 };
-export type Keyframe = { id: string; time: number; pose: Record<string, Transform> };
+export type Keyframe = {
+  id: string;
+  time: number;
+  pose: Record<string, Transform>;
+  origin?: KeyframeOrigin;
+  baked_version?: number;
+  manual_bones?: string[];
+  repairs?: unknown[];
+};
 export type Layer = {
   id: string;
   name: string;
@@ -26,8 +34,30 @@ export type BakedSource = {
   range_end: number;
   bones: string[];
   fps: number;
+  baked_version?: number;
   created_at: string;
+  archive_of?: string;
+  archived_for_version?: number;
+  last_rework_at?: string;
 };
+export type RepairRecord = {
+  id: string;
+  seq: number;
+  source_version: number;
+  updated_frames: string[];
+  kept_manual_frames: string[];
+  segments: string[];
+  frame_snapshots: Record<string, {
+    pose: Record<string, Transform>;
+    baked_version?: number;
+    manual_bones: string[];
+    origin: KeyframeOrigin;
+    repairs: unknown[];
+  }>;
+  snapshot_id?: string | null;
+  at: string;
+};
+export type KeyframeOrigin = "baked" | "manual";
 export type Action = {
   id: string;
   name: string;
@@ -35,6 +65,41 @@ export type Action = {
   keyframes: Keyframe[];
   layers?: Layer[];
   source: BakedSource;
+  readonly?: boolean;
+  rework_history?: RepairRecord[];
+};
+export type ReworkFrame = {
+  id: string;
+  time: number;
+  source_time: number;
+  changed_bones: string[];
+  manual_bones: string[];
+  has_manual: boolean;
+};
+export type ReworkSegment = {
+  id: string;
+  start: number;
+  end: number;
+  frame_ids: string[];
+  bones: string[];
+  manual_frame_ids: string[];
+  has_manual: boolean;
+};
+export type ReworkAnalysis = {
+  action_id: string;
+  source_version: number;
+  baked_version: number;
+  outdated: boolean;
+  affected_frames: ReworkFrame[];
+  segments: ReworkSegment[];
+};
+export type ReworkResult = {
+  project: Project;
+  action: Action;
+  analysis: ReworkAnalysis;
+  updated_frames: string[];
+  kept_manual_frames: string[];
+  archived_action_id: string | null;
 };
 export type Project = {
   name: string;
@@ -50,7 +115,13 @@ export type Clip = Pick<Project, "duration" | "keyframes"> & { layers?: Layer[] 
 export const shortestAngleDelta = (start: number, end: number) =>
   ((((end - start) % 360) + 540) % 360) - 180;
 
-export function validateClipContent(clip: { keyframes: Keyframe[]; layers?: Layer[] }, duration: number, bones: Bone[], prefix = ""): string[] {
+export function validateClipContent(
+  clip: { keyframes: Keyframe[]; layers?: Layer[] },
+  duration: number,
+  bones: Bone[],
+  prefix = "",
+  requiredBones?: Set<string>,
+): string[] {
   const errors: string[] = [];
   const byId = new Map(bones.map((bone) => [bone.id, bone]));
   const times = new Set<number>();
@@ -60,7 +131,9 @@ export function validateClipContent(clip: { keyframes: Keyframe[]; layers?: Laye
     if (frame.time > duration) errors.push(`${prefix}关键姿态 ${frame.id} 的时间 ${frame.time} 超出动作时长`);
     if (times.has(frame.time)) errors.push(`关键姿态时间不能重复：${frame.time}`);
     times.add(frame.time);
+    const required = requiredBones ?? new Set(bones.map((bone) => bone.id));
     bones.forEach((bone) => {
+      if (!required.has(bone.id)) return;
       const transform = frame.pose[bone.id];
       if (!transform) errors.push(`${prefix}关键姿态 ${frame.id} 缺少骨骼 ${bone.id} 的姿态`);
       else if (![transform.x, transform.y, transform.rotation].every(Number.isFinite)) {
@@ -175,7 +248,7 @@ export function validateProject(project: Project): string[] {
     else source.bones.forEach((boneId) => {
       if (!byId.has(boneId)) errors.push(`${prefix}的整理骨骼范围包含未知骨骼 ${boneId}`);
     });
-    errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`));
+    errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`, new Set(source.bones)));
   });
   return errors;
 }
@@ -319,6 +392,29 @@ const poseClose = (a: Record<string, Transform>, b: Record<string, Transform>, t
 
 export type BakeResult = { action: Action; warnings: string[] };
 
+const transformsClose = (a: Transform, b: Transform, tolerance = 1e-7) =>
+  Math.abs(a.x - b.x) <= tolerance
+  && Math.abs(a.y - b.y) <= tolerance
+  && Math.abs(shortestAngleDelta(a.rotation, b.rotation)) <= tolerance;
+
+export function manualBones(frame: Keyframe): Set<string> {
+  if (Array.isArray(frame.manual_bones)) return new Set(frame.manual_bones);
+  if (frame.origin === "manual") return new Set(Object.keys(frame.pose));
+  return new Set();
+}
+
+export function markFrameManual(frame: Keyframe, boneIds?: string[]): Keyframe {
+  const manual = manualBones(frame);
+  (boneIds ?? Object.keys(frame.pose)).forEach((boneId) => {
+    if (boneId in frame.pose) manual.add(boneId);
+  });
+  if (manual.size > 0) {
+    frame.origin = "manual";
+    frame.manual_bones = [...manual].sort();
+  }
+  return frame;
+}
+
 export function bakeAction(
   project: Project,
   rangeStart: number,
@@ -341,45 +437,59 @@ export function bakeAction(
   if (validationErrors.length) problems.push(...validationErrors.map((error) => `工程存在未解决冲突：${error}`));
   if (problems.length) throw new Error(problems.join("；"));
 
-  const warnings: string[] = [];
   const selected = new Set(selectedBones);
+  const coverageProblems: string[] = [];
   (project.layers ?? []).forEach((layer) => {
     const overlaps = Math.min(layer.end, rangeEnd) - Math.max(layer.start, rangeStart);
     if (overlaps <= 0) return;
     const covered = new Set(layer.bones.filter((boneId) => selected.has(boneId)));
     const uncovered = layer.bones.filter((boneId) => !selected.has(boneId));
     if (covered.size > 0 && uncovered.length > 0) {
-      warnings.push(`层「${layer.name}」在范围内只选择了部分作用骨骼，已覆盖 ${uncovered.join("、")}，未处理`);
-    }
-    const changingKeys = (layer.weight_keys ?? []).filter((key) => key.time > rangeStart && key.time < rangeEnd);
-    if (changingKeys.length > 0 && layer.weight > 0) {
-      warnings.push(`层「${layer.name}」在整理范围内包含 ${changingKeys.length} 个权重过渡关键帧，烘焙会固化过渡，如需继续反向调整请先取消权重关键帧`);
+      coverageProblems.push(`层「${layer.name}」在范围内只选择了部分作用骨骼，已覆盖 ${uncovered.join("、")}，未处理`);
     }
   });
-  if (warnings.length) throw new Error(warnings.join("；"));
+  if (coverageProblems.length > 0) throw new Error(coverageProblems.join("；"));
 
   const span = rangeEnd - rangeStart;
   const count = Math.round(span * fps) + 1;
   const keyframes: Keyframe[] = [];
   let previous: Record<string, Transform> | null = null;
+  const frameKeyframes: Keyframe[] = [];
+  const sampleTimes: number[] = [];
   for (let index = 0; index < count; index += 1) {
-    const sourceTime = rangeStart + Math.min(index / fps, span);
+    const sourceTime = Math.round((rangeStart + Math.min(index / fps, span)) * 1e9) / 1e9;
+    sampleTimes.push(sourceTime);
     const pose = sampleLocal(project, sourceTime);
-    const selectedPose = Object.fromEntries(selectedBones.map((boneId) => [boneId, { ...pose[boneId] }]));
+    const selectedPose = Object.fromEntries(selectedBones.map((boneId) => [boneId, {
+      x: Math.round(pose[boneId].x * 1e9) / 1e9,
+      y: Math.round(pose[boneId].y * 1e9) / 1e9,
+      rotation: Math.round(pose[boneId].rotation * 1e9) / 1e9,
+    }]));
     if (previous && poseClose(previous, selectedPose, 1e-7) && keyframes.length >= 2) {
       keyframes[keyframes.length - 1].time = Math.round((sourceTime - rangeStart) * 1e9) / 1e9;
     } else {
       keyframes.push({
-        id: `baked-kf-${keyframes.length}`,
+        id: `baked-kf-${index}`,
         time: Math.round((sourceTime - rangeStart) * 1e9) / 1e9,
         pose: selectedPose,
+        origin: "baked" as const,
+        baked_version: project.version,
+        manual_bones: [],
+        repairs: [],
       });
     }
     previous = selectedPose;
+    frameKeyframes.push(keyframes[keyframes.length - 1]);
   }
   keyframes[keyframes.length - 1].time = span;
 
-  const id = `action-${(project.actions ?? []).length + 1}-${Math.round(rangeStart * 1000)}-${Math.round(rangeEnd * 1000)}`;
+  const existingIds = new Set((project.actions ?? []).map((item) => item.id));
+  let idIndex = existingIds.size + 1;
+  let id = `action-${idIndex}-${Math.round(rangeStart * 1000)}-${Math.round(rangeEnd * 1000)}`;
+  while (existingIds.has(id)) {
+    idIndex += 1;
+    id = `action-${idIndex}-${Math.round(rangeStart * 1000)}-${Math.round(rangeEnd * 1000)}`;
+  }
   const action: Action = {
     id,
     name: name || `整理动作 ${rangeStart}~${rangeEnd}s`,
@@ -393,20 +503,21 @@ export function bakeAction(
       range_end: rangeEnd,
       bones: selectedBones,
       fps,
+      baked_version: project.version,
       created_at: new Date().toISOString(),
     },
   };
   for (let index = 0; index < count; index += 1) {
-    const sourceTime = rangeStart + Math.min(index / fps, span);
+    const sourceTime = sampleTimes[index];
     const sourcePose = sampleLocal(project, sourceTime);
-    const bakedPose = keyframes[Math.min(index, keyframes.length - 1)].pose;
+    const bakedPose = frameKeyframes[index].pose;
     selectedBones.forEach((boneId) => {
-      if (Math.abs(shortestAngleDelta(bakedPose[boneId].rotation, sourcePose[boneId].rotation)) > 1e-7) {
+      if (!transformsClose(bakedPose[boneId], sourcePose[boneId], 1e-9)) {
         throw new Error(`整理结果在 ${sourceTime}s 的骨骼 ${boneId} 与原工程姿态不一致，已放弃整理`);
       }
     });
   }
-  return { action, warnings };
+  return { action, warnings: [] };
 }
 
 export function migrateProject(project: Project): Project {
@@ -414,6 +525,229 @@ export function migrateProject(project: Project): Project {
   if (!Number.isInteger(next.version)) next.version = 1;
   if (!next.actions) next.actions = [];
   (next.layers ?? []).forEach((layer) => { if (!layer.weight_keys) layer.weight_keys = []; });
+  next.actions.forEach((action) => {
+    if (!action.source.baked_version) action.source.baked_version = action.source.source_version;
+    if (!action.rework_history) action.rework_history = [];
+    action.keyframes.forEach((frame) => {
+      if (!frame.origin) frame.origin = "baked";
+      if (frame.baked_version === undefined) frame.baked_version = action.source.baked_version;
+      if (!frame.manual_bones) frame.manual_bones = [];
+      if (!frame.repairs) frame.repairs = [];
+    });
+  });
+  return next;
+}
+
+const actionById = (project: Project, actionId: string): Action => {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  return action;
+};
+
+function segmentKeyframes(action: Action, gap: number): Keyframe[][] {
+  const segments: Keyframe[][] = [];
+  [...action.keyframes].sort((a, b) => a.time - b.time).forEach((frame) => {
+    const last = segments.at(-1);
+    if (last && frame.time - last[last.length - 1].time <= gap + 1e-7) last.push(frame);
+    else segments.push([frame]);
+  });
+  return segments;
+}
+
+export function reworkAnalysis(project: Project, actionId: string, tolerance = 1e-6): ReworkAnalysis {
+  const action = actionById(project, actionId);
+  const source = action.source;
+  const sourceVersion = project.version;
+  const bakedVersion = source.baked_version ?? source.source_version;
+  const fps = source.fps;
+  const gap = 2.5 / Math.max(fps, 1e-6);
+  const boneScope = new Set(source.bones);
+  const affectedFrames: ReworkFrame[] = [];
+  action.keyframes.forEach((frame) => {
+    const sourceTime = source.range_start + frame.time;
+    const sourcePose = sampleLocal(project, sourceTime);
+    const changedBones: string[] = [];
+    boneScope.forEach((boneId) => {
+      const current = frame.pose[boneId];
+      const expected = sourcePose[boneId];
+      if (current && expected && !transformsClose(current, expected, tolerance)) changedBones.push(boneId);
+    });
+    if (changedBones.length > 0) {
+      affectedFrames.push({
+        id: frame.id,
+        time: Math.round(frame.time * 1e9) / 1e9,
+        source_time: Math.round(sourceTime * 1e9) / 1e9,
+        changed_bones: changedBones.sort(),
+        manual_bones: [...manualBones(frame)].sort(),
+        has_manual: manualBones(frame).size > 0,
+      });
+    }
+  });
+  const affectedIds = new Set(affectedFrames.map((frame) => frame.id));
+  const affectedById = new Map(affectedFrames.map((frame) => [frame.id, frame]));
+  const segments: ReworkSegment[] = [];
+  segmentKeyframes(action, gap).forEach((group) => {
+    const hit = group.filter((frame) => affectedIds.has(frame.id));
+    if (hit.length === 0) return;
+    const manualFrames = hit.filter((frame) => manualBones(frame).size > 0);
+    segments.push({
+      id: `seg-${segments.length + 1}`,
+      start: Math.round(group[0].time * 1e9) / 1e9,
+      end: Math.round(group.at(-1)!.time * 1e9) / 1e9,
+      frame_ids: hit.map((frame) => frame.id),
+      bones: [...new Set(hit.flatMap((frame) => affectedById.get(frame.id)!.changed_bones))].sort(),
+      manual_frame_ids: manualFrames.map((frame) => frame.id),
+      has_manual: manualFrames.length > 0,
+    });
+  });
+  return {
+    action_id: actionId,
+    source_version: sourceVersion,
+    baked_version: bakedVersion,
+    outdated: sourceVersion !== bakedVersion,
+    affected_frames: affectedFrames,
+    segments,
+  };
+}
+
+function verifyReworkSeams(action: Action, updatedFrames: Set<string>): void {
+  const ordered = [...action.keyframes].sort((a, b) => a.time - b.time);
+  const gap = 2.5 / Math.max(action.source.fps, 1e-6);
+  for (let i = 0; i < ordered.length - 1; i += 1) {
+    const left = ordered[i];
+    const right = ordered[i + 1];
+    const span = right.time - left.time;
+    if (span <= 0) throw new Error("返修结果出现重复时间关键帧，已放弃");
+    if (span > gap + 1e-7 || !updatedFrames.has(left.id) || !updatedFrames.has(right.id)) continue;
+    Object.entries(left.pose).forEach(([boneId, leftTransform]) => {
+      const rightTransform = right.pose[boneId];
+      if (!rightTransform) return;
+      const step = Math.abs(shortestAngleDelta(leftTransform.rotation, rightTransform.rotation));
+      if (step > 30 + 1e-9) {
+        throw new Error(`返修区间衔接处在 ${left.time.toFixed(3)}s 的骨骼 ${boneId} 姿态不连续（单帧旋转 ${step.toFixed(1)}°），已放弃`);
+      }
+    });
+  }
+}
+
+export function applyRework(
+  project: Project,
+  actionId: string,
+  segmentIds?: string[],
+  decisions?: Record<string, "keep" | "source">,
+  tolerance = 1e-6,
+): ReworkResult {
+  const next = cloneProject(project);
+  const analysis = reworkAnalysis(next, actionId, tolerance);
+  const action = actionById(next, actionId);
+  const validationErrors = validateProject(next);
+  if (validationErrors.length) throw new Error(validationErrors.map((e) => `工程存在未解决冲突：${e}`).join("；"));
+  const chosen = new Set(segmentIds ?? analysis.segments.map((segment) => segment.id));
+  const frameById = new Map(action.keyframes.map((frame) => [frame.id, frame]));
+  const snapshot = structuredClone(action);
+  const sourceVersion = next.version;
+  const updatedFrames: string[] = [];
+  const keptManualFrames: string[] = [];
+  const frameSnapshots: RepairRecord["frame_snapshots"] = {};
+  const repairSeq = (action.rework_history ?? []).length + 1;
+  const repairId = `repair-${repairSeq}-v${sourceVersion}-${Date.now()}`;
+
+  analysis.segments.forEach((segment) => {
+    if (!chosen.has(segment.id)) return;
+    segment.frame_ids.forEach((frameId) => {
+      const frame = frameById.get(frameId);
+      if (!frame) return;
+      const decision = decisions?.[frameId]
+        ?? (segment.manual_frame_ids.includes(frameId) ? "keep" : "source");
+      if (decision === "keep") {
+        if (manualBones(frame).size > 0) keptManualFrames.push(frameId);
+        return;
+      }
+      const sourcePose = sampleLocal(next, action.source.range_start + frame.time);
+      frameSnapshots[frameId] = {
+        pose: structuredClone(frame.pose),
+        baked_version: frame.baked_version,
+        manual_bones: structuredClone(frame.manual_bones ?? []),
+        origin: frame.origin ?? "baked",
+        repairs: structuredClone(frame.repairs ?? []),
+      };
+      segment.bones.forEach((boneId) => {
+        if (sourcePose[boneId] && frame.pose[boneId]) frame.pose[boneId] = { ...sourcePose[boneId] };
+      });
+      const remainingManual = [...manualBones(frame)].filter((boneId) => !segment.bones.includes(boneId));
+      frame.manual_bones = remainingManual.sort();
+      frame.origin = remainingManual.length > 0 ? "manual" : "baked";
+      frame.baked_version = sourceVersion;
+      frame.repairs = [...(frame.repairs ?? []), {
+        id: repairId, segment: segment.id, source_version: sourceVersion,
+        decided: "source", bones: segment.bones, at: new Date().toISOString(),
+      }];
+      updatedFrames.push(frameId);
+    });
+  });
+
+  if (updatedFrames.length === 0 && keptManualFrames.length === 0) {
+    throw new Error("没有选择需要返修的区间，工程未改动");
+  }
+  verifyReworkSeams(action, new Set(updatedFrames));
+
+  let archivedActionId: string | null = null;
+  const previousVersion = action.source.baked_version ?? action.source.source_version;
+  const alreadyArchived = new Set(
+    (next.actions ?? []).map((item) => item.source.archive_of).filter(Boolean),
+  );
+  if (previousVersion !== sourceVersion && !alreadyArchived.has(actionId)) {
+    const archive = structuredClone(snapshot);
+    archive.id = `${actionId}-v${previousVersion}`;
+    archive.name = `${snapshot.name}（v${previousVersion} 旧版）`;
+    archive.readonly = true;
+    archive.source = { ...archive.source, archive_of: actionId, archived_for_version: sourceVersion, baked_version: previousVersion };
+    next.actions = [...(next.actions ?? []), archive];
+    archivedActionId = archive.id;
+  }
+  action.source.baked_version = sourceVersion;
+  action.source.last_rework_at = new Date().toISOString();
+  action.rework_history = [...(action.rework_history ?? []), {
+    id: repairId,
+    seq: repairSeq,
+    source_version: sourceVersion,
+    updated_frames: updatedFrames,
+    kept_manual_frames: keptManualFrames,
+    segments: [...chosen].sort(),
+    frame_snapshots: frameSnapshots,
+    snapshot_id: archivedActionId,
+    at: new Date().toISOString(),
+  }];
+  const verification = validateProject(next);
+  if (verification.length) throw new Error(verification.map((e) => `返修后校验失败，已保留分层工程：${e}`).join("；"));
+  return { project: next, action, analysis, updated_frames: updatedFrames, kept_manual_frames: keptManualFrames, archived_action_id: archivedActionId };
+}
+
+export function revertRework(project: Project, actionId: string, repairId: string): Project {
+  const next = cloneProject(project);
+  const action = actionById(next, actionId);
+  const entries = (action.rework_history ?? []).filter((entry) => entry.id === repairId);
+  if (entries.length === 0) throw new Error("找不到可撤回的返修记录");
+  entries.forEach((entry) => {
+    const laterFrameIds = new Set(
+      (action.rework_history ?? [])
+        .filter((later) => later.seq > entry.seq)
+        .flatMap((later) => [...later.updated_frames, ...later.kept_manual_frames]),
+    );
+    Object.entries(entry.frame_snapshots).forEach(([frameId, oldData]) => {
+      if (laterFrameIds.has(frameId)) return;
+      const current = action.keyframes.find((frame) => frame.id === frameId);
+      if (!current) return;
+      current.pose = structuredClone(oldData.pose);
+      current.baked_version = oldData.baked_version;
+      current.manual_bones = structuredClone(oldData.manual_bones);
+      current.origin = oldData.origin;
+      current.repairs = (current.repairs ?? []).filter((item) => (item as { id?: string }).id !== repairId);
+    });
+  });
+  action.rework_history = (action.rework_history ?? []).filter((entry) => entry.id !== repairId);
+  const errors = validateProject(next);
+  if (errors.length) throw new Error("撤回后校验失败：" + errors.join("；"));
   return next;
 }
 

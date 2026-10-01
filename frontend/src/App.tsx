@@ -19,7 +19,13 @@ import {
   layerEnvelope,
   weightKeyMultiplier,
   sampleLocal,
+  reworkAnalysis,
+  applyRework,
+  revertRework,
+  markFrameManual,
+  manualBones,
   type Action,
+  type ReworkAnalysis,
   type Project,
 } from "./animation";
 import { defaultProject } from "./defaultProject";
@@ -46,6 +52,9 @@ export default function App() {
   const [bakeName, setBakeName] = useState("");
   const [message, setMessage] = useState("已载入内置简单角色；可启动 Python 服务后保存。");
   const [report, setReport] = useState<ConsistencyReport | null>(null);
+  const [rework, setRework] = useState<ReworkAnalysis | null>(null);
+  const [reworkChoices, setReworkChoices] = useState<Record<string, "keep" | "source">>({});
+  const [reworkSegments, setReworkSegments] = useState<Record<string, boolean>>({});
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -71,6 +80,14 @@ export default function App() {
     () => (activeActionId === "__main__" ? null : project.actions?.find((action) => action.id === activeActionId) ?? null),
     [project.actions, activeActionId],
   );
+
+  useEffect(() => {
+    setRework(null);
+    setReworkChoices({});
+    setReworkSegments({});
+  }, [activeActionId]);
+
+  const isArchive = Boolean(activeAction?.readonly);
   const viewDuration = activeAction?.duration ?? project.duration;
   const viewProject = useMemo<Project>(() => (activeAction ? {
     ...project,
@@ -107,8 +124,8 @@ export default function App() {
     setReport(null);
   };
 
-  const commitChange = (nextView: Project, notice?: string) => {
-    if (activeAction) commitAction(nextView, notice);
+  const commitChange = (nextView: Project, notice?: string, manualBoneId?: string) => {
+    if (activeAction) commitAction(nextView, notice, manualBoneId);
     else commitBase(nextView, notice);
   };
 
@@ -228,12 +245,99 @@ export default function App() {
 
   const commitBase = (next: Project, notice?: string) => commit(bumpVersionOnEdit(next), notice);
 
-  const commitAction = (next: Project, notice?: string) => {
+  const analyzeRework = async () => {
     if (!activeAction) return;
+    const local = reworkAnalysis(project, activeAction.id);
+    setRework(local);
+    const defaults: Record<string, "keep" | "source"> = {};
+    local.affected_frames.forEach((frame) => {
+      if (frame.has_manual) defaults[frame.id] = "keep";
+    });
+    setReworkChoices(defaults);
+    setReworkSegments(Object.fromEntries(local.segments.map((segment) => [segment.id, true])));
+    try {
+      const verified = await api<ReworkAnalysis>("/api/rework/analyze", {
+        method: "POST",
+        body: JSON.stringify({ project, action_id: activeAction.id }),
+      });
+      const sameSegments = JSON.stringify(verified.segments) === JSON.stringify(local.segments);
+      if (!sameSegments) setRework({ ...local, segments: verified.segments });
+    } catch {
+      setMessage("Python 服务不可用，返修分析基于本地计算；保存前请启动后端核对。");
+    }
+    setReport(null);
+    setMessage(local.outdated
+      ? `源工程已更新到 v${local.source_version}，本动作整理自 v${local.baked_version}：受影响 ${local.affected_frames.length} 帧、${local.segments.length} 段。`
+      : "整理动作与当前源工程一致；仅显示人工返修过的关键帧。");
+  };
+
+  const runRework = async () => {
+    if (!activeAction || !rework) return;
+    const segmentIds = rework.segments.filter((segment) => reworkSegments[segment.id]).map((segment) => segment.id);
+    if (segmentIds.length === 0) {
+      setMessage("请先勾选至少一个返修区间。");
+      return;
+    }
+    const result = applyRework(project, activeAction.id, segmentIds, reworkChoices);
+    let next = result.project;
+    try {
+      const verified = await api<{ project: Project }>("/api/rework/apply", {
+        method: "POST",
+        body: JSON.stringify({ project, action_id: activeAction.id, segment_ids: segmentIds, decisions: reworkChoices }),
+      });
+      const verifiedAction = verified.project.actions?.find((item) => item.id === activeAction.id);
+      const localAction = next.actions?.find((item) => item.id === activeAction.id);
+      const same = JSON.stringify(verifiedAction?.keyframes) === JSON.stringify(localAction?.keyframes);
+      if (!same) throw new Error("后端返修结果与本地不一致，已放弃以保留分层工程");
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("后端")) {
+        setReport({ ok: false, message: error.message });
+        return;
+      }
+      setMessage("Python 服务不可用，已使用本地返修结果；保存前请启动后端核对。");
+    }
+    if (validateProject(next).length > 0) {
+      setReport({ ok: false, message: "返修结果未通过校验，已放弃，源分层工程完整保留。" });
+      return;
+    }
+    setHistory((items) => [...items.slice(-49), project]);
+    setProject(next);
+    setRework(null);
+    setReworkChoices({});
+    const keptCount = result.kept_manual_frames.length;
+    setReport({
+      ok: true,
+      message: `返修完成：${result.updated_frames.length} 帧重新采用源动作${keptCount > 0 ? `，${keptCount} 帧人工结果已保留` : ""}；相邻区间衔接连续，源分层工程未改动。`,
+    });
+    setMessage(result.archived_action_id ? `旧版本已归档，可在动作库单独播放（${result.archived_action_id}）。` : "返修已应用。");
+  };
+
+  const undoRework = (repairId: string) => {
+    if (!activeAction) return;
+    try {
+      const next = revertRework(project, activeAction.id, repairId);
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setRework(null);
+      setMessage("已撤回该返修决定，其他已确认区间不受影响。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "撤回失败");
+    }
+  };
+
+  const commitAction = (next: Project, notice?: string, manualBoneId?: string) => {
+    if (!activeAction) return;
+    const editedFrameId = editingFrame.id;
+    const updatedKeyframes = next.keyframes.map((frame) => {
+      if (manualBoneId && frame.id === editedFrameId && frame.pose[manualBoneId]) {
+        return markFrameManual(structuredClone(frame), [manualBoneId]);
+      }
+      return frame;
+    });
     const updatedAction: Action = {
       ...activeAction,
       duration: next.duration,
-      keyframes: next.keyframes,
+      keyframes: updatedKeyframes,
       layers: next.layers ?? [],
     };
     const full: Project = {
@@ -305,24 +409,25 @@ export default function App() {
           {activeLayer && !layerOwnsBone && <p className="hint warn">骨骼「{selectedBone.name}」不在层「{activeLayer.name}」的作用范围，该骨骼保持基础动作结果；要编辑请切回基础动作。</p>}
           {activeLayer && layerOwnsBone && <p className="hint">正在修改层关键姿态：<strong>{layerEditingFrame?.time.toFixed(2)}s</strong>；当前时刻层权重 <strong>{(layerWeightNow * 100).toFixed(0)}%</strong>。仅覆盖层内骨骼的局部姿态，子骨骼再按父子旋转累积。</p>}
           {!activeLayer && <p className="hint">正在修改{activeAction ? "整理动作" : "最近的关键姿态"}：<strong>{frames.find((frame) => frame.id === editingFrame.id)?.time.toFixed(2)}s</strong>。{activeAction ? "编辑只影响新动作，源分层工程与版本不变。" : "旋转父骨骼会驱动所有子骨骼，保存时源版本递增。"}</p>}
+          {isArchive && <p className="hint warn">这是返修前归档的旧版本，仅用于单独播放核对，姿态不可编辑。</p>}
           {transform && <>
             <label>局部 X 坐标
-              <input type="range" min="-120" max="120" step="1" value={transform.x}
+              <input type="range" min="-120" max="120" step="1" value={transform.x} disabled={isArchive}
                 onChange={(event) => commitChange(activeLayer && layerEditingFrame
                   ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { x: Number(event.target.value) })
-                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { x: Number(event.target.value) }))} />
+                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { x: Number(event.target.value) }), !activeLayer ? undefined : selectedBone.id)} />
             </label>
             <label>局部 Y 坐标
-              <input type="range" min="-120" max="120" step="1" value={transform.y}
+              <input type="range" min="-120" max="120" step="1" value={transform.y} disabled={isArchive}
                 onChange={(event) => commitChange(activeLayer && layerEditingFrame
                   ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { y: Number(event.target.value) })
-                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { y: Number(event.target.value) }))} />
+                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { y: Number(event.target.value) }), !activeLayer ? undefined : selectedBone.id)} />
             </label>
             <label>局部旋转
-              <input type="range" min="-360" max="360" step="1" value={transform.rotation}
+              <input type="range" min="-360" max="360" step="1" value={transform.rotation} disabled={isArchive}
                 onChange={(event) => commitChange(activeLayer && layerEditingFrame
                   ? updateLayerPose(project, activeLayer.id, layerEditingFrame.id, selectedBone.id, { rotation: Number(event.target.value) })
-                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { rotation: Number(event.target.value) }))} />
+                  : updatePose(viewProject, editingFrame.id, selectedBone.id, { rotation: Number(event.target.value) }), !activeLayer ? undefined : selectedBone.id)} />
             </label>
             <div className="transform-values"><span>x {transform.x.toFixed(1)}</span><span>y {transform.y.toFixed(1)}</span><span>θ {transform.rotation.toFixed(1)}°</span></div>
           </>}
@@ -343,10 +448,52 @@ export default function App() {
           </button>)}
         </div>
         {activeAction && <div className="provenance hint">
-          <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}，
+          <strong>{activeAction.name}</strong>：{isArchive ? `v${activeAction.source.baked_version} 旧版归档，仅用于播放核对；` : ""}整理自源工程 v{activeAction.source.source_version}，当前同步至 v{activeAction.source.baked_version ?? activeAction.source.source_version}；
          时间 {activeAction.source.range_start.toFixed(2)}~{activeAction.source.range_end.toFixed(2)}s，
          骨骼 {activeAction.source.bones.length} 根，采样 {activeAction.source.fps}fps，
-         生成于 {new Date(activeAction.source.created_at).toLocaleString()}。修改下方关键帧只影响本动作；要随源工程更新请回到源工程修改后重新整理（产生新版本）。
+         生成于 {new Date(activeAction.source.created_at).toLocaleString()}。{isArchive ? "" : "在动作关键帧上手工修改会被标记为人工返修；源工程修改后可在下方局部返修。"}
+        </div>}
+        {activeAction && !isArchive && <div className="rework-panel">
+          <button onClick={analyzeRework}>检查源工程修订并预览受影响区间</button>
+          {rework && <div className="rework-report">
+            {rework.affected_frames.length === 0 && <p className="hint">没有受源修订影响的关键帧；人工返修帧会保持独立标记。</p>}
+            {rework.segments.length > 0 && <>
+              <p className="hint">源工程 v{rework.baked_version} → v{rework.source_version}：共 {rework.affected_frames.length} 帧 / {rework.segments.length} 个相邻返修区间，可逐段决定。</p>
+              {rework.segments.map((segment) => <div key={segment.id} className="rework-segment">
+                <label className="seg-toggle"><input type="checkbox" checked={reworkSegments[segment.id] ?? true}
+                  onChange={(event) => setReworkSegments((items) => ({ ...items, [segment.id]: event.target.checked }))} />更新此段</label>
+                <strong>{segment.start.toFixed(3)}~{segment.end.toFixed(3)}s</strong>
+                <span>骨骼：{segment.bones.map((boneId) => project.skeleton.bones.find((bone) => bone.id === boneId)?.name ?? boneId).join("、")}</span>
+                {segment.has_manual && <span className="warn">含 {segment.manual_frame_ids.length} 帧人工返修，默认保留，不会被静默覆盖</span>}
+                <details>
+                  <summary>{segment.frame_ids.length} 帧明细</summary>
+                  <div className="rework-frames">
+                    {segment.frame_ids.map((frameId) => {
+                      const info = rework.affected_frames.find((frame) => frame.id === frameId)!;
+                      const choice = reworkChoices[frameId] ?? (info.has_manual ? "keep" : "source");
+                      return <label key={frameId} className={info.has_manual ? "manual-frame" : ""}>
+                        <button onClick={() => { setPlaying(false); setTime(info.time); }}>{info.time.toFixed(3)}s</button>
+                        <span>{info.changed_bones.map((boneId) => project.skeleton.bones.find((bone) => bone.id === boneId)?.name ?? boneId).join("、")}</span>
+                        {info.has_manual && <select value={choice} disabled={!info.has_manual}
+                          onChange={(event) => setReworkChoices((items) => ({ ...items, [frameId]: event.target.value as "keep" | "source" }))}>
+                          <option value="keep">保留人工结果</option>
+                          <option value="source">重新采用源动作</option>
+                        </select>}
+                      </label>;
+                    })}
+                  </div>
+                </details>
+              </div>)}
+              <button className="primary" onClick={runRework}>应用所选区间返修（相邻区间自动保持衔接连续）</button>
+            </>}
+          </div>}
+          {activeAction.rework_history && activeAction.rework_history.length > 0 && <div className="rework-history">
+            <span>返修记录：</span>
+            {[...activeAction.rework_history].reverse().map((entry) => <span key={entry.id} className="weight-key">
+              v{entry.source_version}：{entry.updated_frames.length} 帧采用源动作，{entry.kept_manual_frames.length} 帧保留人工
+              <button title="撤回该返修（不影响其他已确认区间）" onClick={() => undoRework(entry.id)}>撤回</button>
+            </span>)}
+          </div>}
         </div>}
         {!activeAction && <div className="bake-panel">
           <div className="layer-controls">
@@ -447,10 +594,10 @@ export default function App() {
         <div className="card-title"><h2>{activeAction ? "整理动作关键姿态" : "源工程关键姿态时间轴"}</h2><span>{activeAction ? "逐帧烘焙，可继续编辑；源工程不受影响" : "移动滑块会同时修改时间；复制会保留完整姿态"}</span></div>
         <div className="keyframe-list">
           {frames.map((frame) => <div key={frame.id} className={frame.id === editingFrame.id ? "keyframe active" : "keyframe"}>
-            <button onClick={() => { setPlaying(false); setTime(frame.time); }}>{frame.time.toFixed(2)}s</button>
-            <input type="range" min={0} max={viewDuration} step={0.01} value={frame.time}
+            <button onClick={() => { setPlaying(false); setTime(frame.time); }}>{frame.time.toFixed(2)}s{activeAction && manualBones(frame).size > 0 && <em className="manual-tag" title="人工返修关键帧">手修</em>}</button>
+            <input type="range" min={0} max={viewDuration} step={0.01} value={frame.time} disabled={isArchive}
               onChange={(event) => commitChange(moveKeyframe(viewProject, frame.id, Number(event.target.value)), "关键姿态已移动。")} />
-            <button title="复制关键姿态" onClick={() => commitChange(duplicateKeyframe(viewProject, frame.id), "关键姿态已复制。")}><Copy size={15} /></button>
+            <button title="复制关键姿态" disabled={isArchive} onClick={() => commitChange(duplicateKeyframe(viewProject, frame.id), "关键姿态已复制。")}><Copy size={15} /></button>
           </div>)}
         </div>
         <div className="duration-row">
