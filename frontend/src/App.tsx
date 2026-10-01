@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Copy, Layers, Pause, Play, Repeat, RotateCcw, Save, Scissors, TriangleAlert } from "lucide-react";
 import { api } from "./api";
 import {
+  analyzeRebake,
+  applyRebake,
   addWeightKey,
   addLayerKeyframe,
   bakeAction,
@@ -46,6 +48,9 @@ export default function App() {
   const [bakeName, setBakeName] = useState("");
   const [message, setMessage] = useState("已载入内置简单角色；可启动 Python 服务后保存。");
   const [report, setReport] = useState<ConsistencyReport | null>(null);
+  const [segmentChoices, setSegmentChoices] = useState<Record<number, "source" | "keep">>({});
+  const [segmentSelected, setSegmentSelected] = useState<Record<number, boolean>>({});
+  const [previewRevision, setPreviewRevision] = useState<number | null>(null);
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -71,13 +76,22 @@ export default function App() {
     () => (activeActionId === "__main__" ? null : project.actions?.find((action) => action.id === activeActionId) ?? null),
     [project.actions, activeActionId],
   );
+  const rebakeSegments = useMemo(
+    () => (activeAction ? analyzeRebake(project, activeAction) : []),
+    [project, activeAction],
+  );
+  const previewKeyframes = useMemo(() => {
+    if (!activeAction || previewRevision === null) return null;
+    if (previewRevision === (activeAction.revision ?? 1)) return activeAction.keyframes;
+    return activeAction.previous_versions?.find((item) => item.revision === previewRevision)?.keyframes ?? null;
+  }, [activeAction, previewRevision]);
   const viewDuration = activeAction?.duration ?? project.duration;
   const viewProject = useMemo<Project>(() => (activeAction ? {
     ...project,
     duration: activeAction.duration,
-    keyframes: activeAction.keyframes,
+    keyframes: previewKeyframes ?? activeAction.keyframes,
     layers: activeAction.layers ?? [],
-  } : project), [project, activeAction]);
+  } : project), [project, activeAction, previewKeyframes]);
 
   const frames = useMemo(() => orderedKeyframes(viewProject), [viewProject]);
   const editingFrame = useMemo(() => nearestEditableFrame(viewProject, time), [viewProject, time]);
@@ -230,6 +244,10 @@ export default function App() {
 
   const commitAction = (next: Project, notice?: string) => {
     if (!activeAction) return;
+    if (previewRevision !== null && previewRevision !== (activeAction.revision ?? 1)) {
+      setMessage("正在回放旧版本，请先切回当前修订再编辑。");
+      return;
+    }
     const updatedAction: Action = {
       ...activeAction,
       duration: next.duration,
@@ -241,6 +259,56 @@ export default function App() {
       actions: (project.actions ?? []).map((item) => (item.id === activeAction.id ? updatedAction : item)),
     };
     commit(full, notice);
+  };
+
+  const switchAction = (id: string) => {
+    setActiveActionId(id);
+    setActiveLayerId(null);
+    setTime(0);
+    setSegmentChoices({});
+    setSegmentSelected({});
+    setPreviewRevision(null);
+  };
+
+  const runRebake = async () => {
+    if (!activeAction) return;
+    const decisions = rebakeSegments
+      .map((segment, index) => ({ segment, index }))
+      .filter(({ index }) => segmentSelected[index])
+      .map(({ segment, index }) => ({
+        segment: { start: segment.start, end: segment.end },
+        resolution: segment.manual ? (segmentChoices[index] ?? "keep") : "source" as "source" | "keep",
+      }))
+      .filter((decision) => decision.resolution === "source");
+    if (decisions.length === 0) {
+      setMessage("未选择需要采用源动作的区间；保留手工结果无需提交。");
+      return;
+    }
+    try {
+      let next = applyRebake(project, activeAction.id, decisions);
+      try {
+        const verified = await api<{ action: Action }>("/api/rebake", {
+          method: "POST",
+          body: JSON.stringify({ project, action_id: activeAction.id, decisions }),
+        });
+        next = { ...next, actions: (next.actions ?? []).map((item) => (item.id === activeAction.id ? verified.action : item)) };
+      } catch {
+        setMessage("Python 服务不可用，已使用本地返修结果；保存前请启动后端核对。");
+      }
+      if (validateProject(next).length > 0) {
+        setMessage("返修结果未通过校验，已放弃（工程未修改）。");
+        return;
+      }
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setSegmentChoices({});
+      setSegmentSelected({});
+      const updated = next.actions?.find((item) => item.id === activeAction.id);
+      setReport({ ok: true, message: `已应用 ${decisions.length} 个返修区间，动作修订号升为 r${updated?.revision ?? "?"}；旧版本仍可在下方回放，撤销只回退本次决定。` });
+      setMessage("局部返修完成：未选区间与保留的手工关键帧均未改动。");
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "返修失败" });
+    }
   };
 
   return (
@@ -333,21 +401,56 @@ export default function App() {
         <div className="card-title"><h2>动作库与整理</h2><span>源分层工程与整理后的新动作分开保存，各自带版本溯源</span></div>
         <div className="action-tabs">
           <button className={activeActionId === "__main__" ? "chip selected" : "chip"}
-            onClick={() => { setActiveActionId("__main__"); setActiveLayerId(null); setTime(0); }}>
+            onClick={() => switchAction("__main__")}>
             <Layers size={14} />源分层工程 v{project.version}
           </button>
           {(project.actions ?? []).map((action) => <button key={action.id}
             className={activeActionId === action.id ? "chip selected" : "chip"}
-            onClick={() => { setActiveActionId(action.id); setActiveLayerId(null); setTime(0); }}>
-            {action.name}（源 v{action.source.source_version}）
+            onClick={() => switchAction(action.id)}>
+            {action.name}（源 v{action.source.source_version} · r{action.revision ?? 1}）
           </button>)}
         </div>
-        {activeAction && <div className="provenance hint">
-          <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}，
-         时间 {activeAction.source.range_start.toFixed(2)}~{activeAction.source.range_end.toFixed(2)}s，
-         骨骼 {activeAction.source.bones.length} 根，采样 {activeAction.source.fps}fps，
-         生成于 {new Date(activeAction.source.created_at).toLocaleString()}。修改下方关键帧只影响本动作；要随源工程更新请回到源工程修改后重新整理（产生新版本）。
-        </div>}
+        {activeAction && <>
+          <div className="provenance hint">
+            <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}（当前源 v{project.version}），
+           时间 {activeAction.source.range_start.toFixed(2)}~{activeAction.source.range_end.toFixed(2)}s，
+           骨骼 {activeAction.source.bones.length} 根，采样 {activeAction.source.fps}fps，
+           生成于 {new Date(activeAction.source.created_at).toLocaleString()}，
+           当前修订 r{activeAction.revision ?? 1}{activeAction.source.updated_at ? `，最近返修 ${new Date(activeAction.source.updated_at).toLocaleString()}` : ""}。
+           修改下方关键帧只影响本动作并标记为人工返修；保存重开后仍与源修订、整理结果区分。
+          </div>
+          {(activeAction.previous_versions ?? []).length > 0 && <div className="layer-controls">
+            <label>回放修订
+              <select value={previewRevision ?? (activeAction.revision ?? 1)}
+                onChange={(event) => { setPreviewRevision(Number(event.target.value)); setTime(0); }}>
+                {(activeAction.previous_versions ?? []).map((item) => (
+                  <option key={item.revision} value={item.revision}>旧版本 r{item.revision}（{new Date(item.saved_at).toLocaleString()}）</option>
+                ))}
+                <option value={activeAction.revision ?? 1}>当前 r{activeAction.revision ?? 1}</option>
+              </select>
+            </label>
+            {previewRevision !== null && previewRevision !== (activeAction.revision ?? 1)
+              && <span className="hint warn">正在回放旧版本 r{previewRevision}（只读）；切回当前修订后才能编辑。</span>}
+          </div>}
+          {rebakeSegments.length > 0 && <div className="rebake-panel">
+            <div className="card-title"><h3>源工程已更新：{rebakeSegments.length} 个受影响区间</h3><span>勾选要采用源动作的区间；人工返修帧需单独决定</span></div>
+            {rebakeSegments.map((segment, index) => <div key={index} className={segment.manual ? "rebake-row manual" : "rebake-row"}>
+              <label>
+                <input type="checkbox" checked={!!segmentSelected[index]}
+                  onChange={(event) => setSegmentSelected((prev) => ({ ...prev, [index]: event.target.checked }))} />
+                {segment.start.toFixed(2)}~{segment.end.toFixed(2)}s · {segment.bones.join("、")}
+              </label>
+              {segment.manual && <span className="rebake-choice">
+                <em>含人工返修关键帧：</em>
+                <label><input type="radio" name={"seg-" + index} checked={(segmentChoices[index] ?? "keep") === "keep"}
+                  onChange={() => setSegmentChoices((prev) => ({ ...prev, [index]: "keep" }))} />保留手工结果</label>
+                <label><input type="radio" name={"seg-" + index} checked={segmentChoices[index] === "source"}
+                  onChange={() => setSegmentChoices((prev) => ({ ...prev, [index]: "source" }))} />重新采用源动作</label>
+              </span>}
+            </div>)}
+            <button className="primary bake-btn" onClick={runRebake}><Scissors size={15} />应用所选返修区间（保留其余决定）</button>
+          </div>}
+        </>}
         {!activeAction && <div className="bake-panel">
           <div className="layer-controls">
             <label>片段开始<input type="number" min={0} max={project.duration} step={0.05} value={bakeStart}

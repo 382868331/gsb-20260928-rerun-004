@@ -358,6 +358,12 @@ def validate_project(project: dict[str, Any]) -> list[str]:
         if not isinstance(action_duration, (int, float)) or not math.isfinite(action_duration) or action_duration <= 0:
             errors.append(f"{prefix}的时长必须是正数")
             continue
+        revision = action.get("revision", 1)
+        if not isinstance(revision, int) or revision < 1:
+            errors.append(f"{prefix}的修订号必须是正整数")
+        previous_versions = action.get("previous_versions", [])
+        if not isinstance(previous_versions, list):
+            errors.append(f"{prefix}的历史版本必须是数组")
         source = action.get("source")
         if not isinstance(source, dict):
             errors.append(f"{prefix}缺少来源溯源信息")
@@ -557,6 +563,7 @@ def bake_action(
                 "id": f"{action_id or 'baked'}-kf-{len(keyframes)}",
                 "time": round(sample_time - float(range_start), 9),
                 "pose": selected_pose,
+                "origin": "baked",
             })
         previous = selected_pose
     keyframes[-1]["time"] = span
@@ -581,6 +588,8 @@ def bake_action(
         "duration": span,
         "keyframes": keyframes,
         "layers": [],
+        "revision": 1,
+        "previous_versions": [],
         "source": {
             "action_id": "__main__",
             "source_version": source_version,
@@ -631,19 +640,151 @@ def _range_incompatibility_notes(
         covered = layer_bone_set & selected
         uncovered = layer_bone_set - selected
         partial = bool(covered and uncovered)
-        weight_keys = layer.get("weight_keys") or []
-        changing_keys = [key for key in weight_keys if float(range_start) < float(key["time"]) < float(range_end)]
         if partial:
             notes.append(
                 f"层「{layer.get('name', layer.get('id'))}」在范围内只选择了部分作用骨骼，已覆盖 "
                 + "、".join(sorted(uncovered)) + "，未处理"
             )
-        if changing_keys and layer.get("weight", 0.0) > 0:
-            notes.append(
-                f"层「{layer.get('name', layer.get('id'))}」在整理范围内包含 {len(changing_keys)} 个权重过渡关键帧，"
-                "烘焙会固化过渡，如需继续反向调整请先取消权重关键帧"
-            )
     return notes
+
+
+def _transform_differs(a: dict[str, float], b: dict[str, float], tolerance: float = 1e-7) -> bool:
+    return (
+        abs(float(a["x"]) - float(b["x"])) > tolerance
+        or abs(float(a["y"]) - float(b["y"])) > tolerance
+        or abs(shortest_angle_delta(float(b["rotation"]), float(a["rotation"]))) > tolerance
+    )
+
+
+def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare a baked action against the current source project.
+
+    Returns affected segments in action-local time. Each segment lists the
+    bones whose baked pose no longer matches the source, and flags segments
+    containing keyframes the user manually retouched on the action.
+    """
+    source = action.get("source") or {}
+    fps = float(source.get("fps", 60.0))
+    range_start = float(source.get("range_start", 0.0))
+    span = float(action["duration"])
+    bones = [bone_id for bone_id in source.get("bones", []) if isinstance(bone_id, str)]
+    count = int(round(span * fps)) + 1
+    keyframe_by_index = {
+        int(round(float(frame["time"]) * fps)): frame for frame in action.get("keyframes", [])
+    }
+    cells: list[dict[str, Any]] = []
+    for index in range(count):
+        local_time = min(index / fps, span)
+        source_pose = sample_local(project, range_start + local_time)
+        baked_pose = sample_frames(action["keyframes"], local_time)
+        differing = [
+            bone_id for bone_id in bones
+            if bone_id in source_pose and bone_id in baked_pose
+            and _transform_differs(source_pose[bone_id], baked_pose[bone_id])
+        ]
+        if not differing:
+            continue
+        keyframe = keyframe_by_index.get(index)
+        cells.append({
+            "index": index,
+            "time": local_time,
+            "bones": differing,
+            "manual": bool(keyframe is not None and keyframe.get("origin") == "manual"),
+        })
+    segments: list[dict[str, Any]] = []
+    for cell in cells:
+        if segments and cell["index"] == segments[-1]["_last_index"] + 1 \
+                and cell["manual"] == segments[-1]["manual"]:
+            segment = segments[-1]
+            segment["_last_index"] = cell["index"]
+            segment["end"] = cell["time"]
+            segment["bones"] = sorted(set(segment["bones"]) | set(cell["bones"]))
+            segment["manual"] = segment["manual"] or cell["manual"]
+        else:
+            segments.append({
+                "_last_index": cell["index"],
+                "start": cell["time"],
+                "end": cell["time"],
+                "bones": list(cell["bones"]),
+                "manual": cell["manual"],
+            })
+    for segment in segments:
+        segment.pop("_last_index")
+    return segments
+
+
+def apply_rebake(
+    project: dict[str, Any],
+    action_id: str,
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply per-segment rebake decisions to one action; returns the new action.
+
+    Each decision is {"segment": {"start", "end"}, "resolution": "source"|"keep"}.
+    "source" re-bakes that window from the current source project (replacing any
+    manual keyframes inside it); "keep" leaves the window untouched. Adjacent
+    untouched frames still equal the source pose, so neighbouring segments stay
+    pose-continuous. The previous keyframes are snapshotted so older revisions
+    remain playable after save/reload.
+    """
+    action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
+    if action is None:
+        raise ValueError(f"找不到整理动作 {action_id}")
+    source = action["source"]
+    fps = float(source.get("fps", 60.0))
+    range_start = float(source["range_start"])
+    span = float(action["duration"])
+    bones = list(source["bones"])
+
+    adopted = [d for d in decisions if isinstance(d, dict) and d.get("resolution") == "source"]
+    if not adopted:
+        raise ValueError("没有需要应用的返修区间")
+
+    keyframes = [dict(frame, pose=deepcopy(frame["pose"])) for frame in action["keyframes"]]
+    for decision in adopted:
+        window = decision.get("segment") or {}
+        start = float(window.get("start", 0.0))
+        end = float(window.get("end", 0.0))
+        if end < start or start < -1e-9 or end > span + 1e-9:
+            raise ValueError(f"返修区间 {start:g}~{end:g}s 无效")
+        keyframes = [
+            frame for frame in keyframes
+            if float(frame["time"]) < start - 1e-9 or float(frame["time"]) > end + 1e-9
+        ]
+        first_index = int(math.ceil(start * fps - 1e-9))
+        last_index = int(math.floor(end * fps + 1e-9))
+        for index in range(first_index, last_index + 1):
+            local_time = min(index / fps, span)
+            source_pose = sample_local(project, range_start + local_time)
+            keyframes.append({
+                "id": f"{action_id}-r{int(action.get('revision', 1)) + 1}-kf-{index}",
+                "time": round(local_time, 9),
+                "pose": {
+                    bone_id: {
+                        "x": float(source_pose[bone_id]["x"]),
+                        "y": float(source_pose[bone_id]["y"]),
+                        "rotation": float(source_pose[bone_id]["rotation"]),
+                    }
+                    for bone_id in bones
+                },
+                "origin": "baked",
+            })
+    keyframes.sort(key=lambda frame: float(frame["time"]))
+
+    updated = deepcopy(action)
+    updated["keyframes"] = keyframes
+    updated["revision"] = int(action.get("revision", 1)) + 1
+    previous_versions = list(action.get("previous_versions", []))
+    previous_versions.append({
+        "revision": int(action.get("revision", 1)),
+        "keyframes": deepcopy(action["keyframes"]),
+        "saved_at": _utc_now_iso(),
+    })
+    updated["previous_versions"] = previous_versions
+    updated["source"] = {**source, "updated_at": _utc_now_iso()}
+    if not analyze_rebake(project, updated):
+        updated["source"]["source_version"] = int(project.get("version", 1))
+    return updated
 
 
 def sample_local(project: dict[str, Any], time: float) -> dict[str, dict[str, float]]:

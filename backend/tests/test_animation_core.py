@@ -5,6 +5,8 @@ from copy import deepcopy
 from pathlib import Path
 
 from animation_core import (
+    analyze_rebake,
+    apply_rebake,
     bake_action,
     default_project,
     evaluate_world,
@@ -207,6 +209,71 @@ class AnimationCoreTests(unittest.TestCase):
             loaded = load_project(path)
             self.assertEqual(loaded["version"], 1)
             self.assertEqual(loaded["actions"], [])
+
+    def test_bake_allows_smooth_weight_transition_keyframes(self):
+        project = default_project()
+        project["layers"][0]["weight_keys"] = [
+            {"id": "wk-0", "time": 0.2, "weight": 0.0},
+            {"id": "wk-1", "time": 0.5, "weight": 1.0},
+            {"id": "wk-2", "time": 0.9, "weight": 0.3},
+        ]
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        action = bake_action(project, 0.15, 1.05, bone_ids, "过渡", action_id="a-w")
+        self.assertEqual(validate_project({**project, "actions": [action]}), [])
+        for frame in action["keyframes"]:
+            source_pose = sample_local(project, 0.15 + frame["time"])
+            for bone_id in ("upper_arm_r", "forearm_r"):
+                self.assertLessEqual(
+                    abs(shortest_angle_delta(frame["pose"][bone_id]["rotation"], source_pose[bone_id]["rotation"])),
+                    1e-7,
+                )
+        self.assertTrue(all(frame["origin"] == "baked" for frame in action["keyframes"]))
+
+    def test_rebake_analysis_and_partial_apply_keep_manual_and_continuity(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        action = bake_action(project, 0.0, 1.2, bone_ids, "片段", action_id="a1")
+        project["actions"] = [action]
+        # manual retouch on the action, then a source edit that overlaps it
+        project["actions"][0]["keyframes"][10]["pose"]["spine"]["rotation"] = 45.0
+        project["actions"][0]["keyframes"][10]["origin"] = "manual"
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        segments = analyze_rebake(project, project["actions"][0])
+        self.assertTrue(segments)
+        self.assertTrue(any(segment["manual"] for segment in segments))
+        self.assertTrue(all("spine" in segment["bones"] for segment in segments))
+        manual_segment = next(segment for segment in segments if segment["manual"])
+        other_segments = [segment for segment in segments if segment is not manual_segment]
+        # keep the manual segment, adopt source for the rest
+        decisions = [{"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in other_segments]
+        decisions.append({"segment": {"start": manual_segment["start"], "end": manual_segment["end"]}, "resolution": "keep"})
+        updated = apply_rebake(project, "a1", decisions)
+        self.assertEqual(updated["revision"], 2)
+        self.assertEqual(len(updated["previous_versions"]), 1)
+        kept = [f for f in updated["keyframes"] if f.get("origin") == "manual"]
+        self.assertEqual(len(kept), 1)
+        self.assertAlmostEqual(kept[0]["pose"]["spine"]["rotation"], 45.0)
+        # adopted frames match the source exactly; neighbours were untouched source
+        # samples, so segment boundaries stay pose-continuous
+        for frame in updated["keyframes"]:
+            if frame.get("origin") == "baked":
+                source_pose = sample_local(project, frame["time"])
+                self.assertLessEqual(
+                    abs(shortest_angle_delta(frame["pose"]["spine"]["rotation"], source_pose["spine"]["rotation"])),
+                    1e-7,
+                )
+        # remaining diff is only the kept manual frame
+        remaining = analyze_rebake(project, updated)
+        self.assertTrue(all(segment["manual"] for segment in remaining))
+        # now adopt the source over the manual frame too
+        final = apply_rebake(project | {"actions": [updated]}, "a1",
+                               [{"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in remaining])
+        self.assertEqual(analyze_rebake(project, final), [])
+        self.assertEqual(final["source"]["source_version"], 2)
+        self.assertEqual(len(final["previous_versions"]), 2)
+        round_trip = json.loads(json.dumps({**project, "actions": [final]}))
+        self.assertEqual(validate_project(round_trip), [])
 
 
 if __name__ == "__main__":

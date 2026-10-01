@@ -5,7 +5,7 @@ export type Bone = {
   parent: string | null;
   rest: { x: number; y: number };
 };
-export type Keyframe = { id: string; time: number; pose: Record<string, Transform> };
+export type Keyframe = { id: string; time: number; pose: Record<string, Transform>; origin?: "baked" | "manual" };
 export type Layer = {
   id: string;
   name: string;
@@ -27,13 +27,17 @@ export type BakedSource = {
   bones: string[];
   fps: number;
   created_at: string;
+  updated_at?: string;
 };
+export type ActionRevision = { revision: number; keyframes: Keyframe[]; saved_at: string };
 export type Action = {
   id: string;
   name: string;
   duration: number;
   keyframes: Keyframe[];
   layers?: Layer[];
+  revision?: number;
+  previous_versions?: ActionRevision[];
   source: BakedSource;
 };
 export type Project = {
@@ -351,10 +355,6 @@ export function bakeAction(
     if (covered.size > 0 && uncovered.length > 0) {
       warnings.push(`层「${layer.name}」在范围内只选择了部分作用骨骼，已覆盖 ${uncovered.join("、")}，未处理`);
     }
-    const changingKeys = (layer.weight_keys ?? []).filter((key) => key.time > rangeStart && key.time < rangeEnd);
-    if (changingKeys.length > 0 && layer.weight > 0) {
-      warnings.push(`层「${layer.name}」在整理范围内包含 ${changingKeys.length} 个权重过渡关键帧，烘焙会固化过渡，如需继续反向调整请先取消权重关键帧`);
-    }
   });
   if (warnings.length) throw new Error(warnings.join("；"));
 
@@ -373,6 +373,7 @@ export function bakeAction(
         id: `baked-kf-${keyframes.length}`,
         time: Math.round((sourceTime - rangeStart) * 1e9) / 1e9,
         pose: selectedPose,
+        origin: "baked",
       });
     }
     previous = selectedPose;
@@ -386,6 +387,8 @@ export function bakeAction(
     duration: span,
     keyframes,
     layers: [],
+    revision: 1,
+    previous_versions: [],
     source: {
       action_id: "__main__",
       source_version: project.version,
@@ -414,7 +417,93 @@ export function migrateProject(project: Project): Project {
   if (!Number.isInteger(next.version)) next.version = 1;
   if (!next.actions) next.actions = [];
   (next.layers ?? []).forEach((layer) => { if (!layer.weight_keys) layer.weight_keys = []; });
+  next.actions.forEach((action) => {
+    if (!Number.isInteger(action.revision)) action.revision = 1;
+    if (!action.previous_versions) action.previous_versions = [];
+  });
   return next;
+}
+
+export type RebakeSegment = { start: number; end: number; bones: string[]; manual: boolean };
+
+const transformDiffers = (a: Transform, b: Transform, tolerance = 1e-7) =>
+  Math.abs(a.x - b.x) > tolerance
+  || Math.abs(a.y - b.y) > tolerance
+  || Math.abs(shortestAngleDelta(b.rotation, a.rotation)) > tolerance;
+
+export function analyzeRebake(project: Project, action: Action): RebakeSegment[] {
+  const { fps, range_start: rangeStart, bones } = action.source;
+  const span = action.duration;
+  const count = Math.round(span * fps) + 1;
+  const keyframeByIndex = new Map(action.keyframes.map((frame) => [Math.round(frame.time * fps), frame]));
+  const cells: { index: number; time: number; bones: string[]; manual: boolean }[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const localTime = Math.min(index / fps, span);
+    const sourcePose = sampleLocal(project, rangeStart + localTime);
+    const bakedPose = sampleFrames(action.keyframes, localTime);
+    const differing = bones.filter((boneId) => sourcePose[boneId] && bakedPose[boneId]
+      && transformDiffers(sourcePose[boneId], bakedPose[boneId]));
+    if (differing.length === 0) continue;
+    cells.push({ index, time: localTime, bones: differing, manual: keyframeByIndex.get(index)?.origin === "manual" });
+  }
+  const segments: (RebakeSegment & { lastIndex: number })[] = [];
+  cells.forEach((cell) => {
+    const last = segments[segments.length - 1];
+    if (last && cell.index === last.lastIndex + 1 && cell.manual === last.manual) {
+      last.lastIndex = cell.index;
+      last.end = cell.time;
+      last.bones = [...new Set([...last.bones, ...cell.bones])].sort();
+    } else {
+      segments.push({ lastIndex: cell.index, start: cell.time, end: cell.time, bones: [...cell.bones], manual: cell.manual });
+    }
+  });
+  return segments.map(({ start, end, bones: segmentBones, manual }) => ({ start, end, bones: segmentBones, manual }));
+}
+
+export type RebakeDecision = { segment: { start: number; end: number }; resolution: "source" | "keep" };
+
+export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[]): Project {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  const adopted = decisions.filter((decision) => decision.resolution === "source");
+  if (adopted.length === 0) throw new Error("没有需要应用的返修区间");
+  const { fps, range_start: rangeStart, bones } = action.source;
+  const span = action.duration;
+  let keyframes = action.keyframes.map((frame) => ({ ...frame, pose: structuredClone(frame.pose) }));
+  const revision = (action.revision ?? 1) + 1;
+  adopted.forEach(({ segment }) => {
+    const { start, end } = segment;
+    if (!(end >= start) || start < -1e-9 || end > span + 1e-9) throw new Error(`返修区间 ${start}~${end}s 无效`);
+    keyframes = keyframes.filter((frame) => frame.time < start - 1e-9 || frame.time > end + 1e-9);
+    const firstIndex = Math.ceil(start * fps - 1e-9);
+    const lastIndex = Math.floor(end * fps + 1e-9);
+    for (let index = firstIndex; index <= lastIndex; index += 1) {
+      const localTime = Math.min(index / fps, span);
+      const sourcePose = sampleLocal(project, rangeStart + localTime);
+      keyframes.push({
+        id: `${actionId}-r${revision}-kf-${index}`,
+        time: Math.round(localTime * 1e9) / 1e9,
+        pose: Object.fromEntries(bones.map((boneId) => [boneId, { ...sourcePose[boneId] }])),
+        origin: "baked",
+      });
+    }
+  });
+  keyframes.sort((a, b) => a.time - b.time);
+  const updated: Action = {
+    ...structuredClone(action),
+    keyframes,
+    revision,
+    previous_versions: [
+      ...(action.previous_versions ?? []),
+      { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
+    ],
+    source: { ...action.source, updated_at: new Date().toISOString() },
+  };
+  if (analyzeRebake(project, updated).length === 0) updated.source.source_version = project.version;
+  return {
+    ...project,
+    actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)),
+  };
 }
 
 export function addWeightKey(project: Project, layerId: string, time: number, weight: number): Project {
@@ -443,7 +532,10 @@ export function removeWeightKey(project: Project, layerId: string, keyId: string
 export function moveKeyframe(project: Project, keyframeId: string, time: number): Project {
   const next = cloneProject(project);
   const frame = next.keyframes.find((item) => item.id === keyframeId);
-  if (frame) frame.time = Math.min(Math.max(time, 0), next.duration);
+  if (frame) {
+    frame.time = Math.min(Math.max(time, 0), next.duration);
+    if (frame.origin) frame.origin = "manual";
+  }
   return next;
 }
 
@@ -453,14 +545,17 @@ export function duplicateKeyframe(project: Project, keyframeId: string): Project
   if (!source) return next;
   const offset = Math.min(0.1, Math.max(0.01, next.duration / 20));
   const time = source.time + offset >= next.duration ? source.time - offset : source.time + offset;
-  next.keyframes.push({ ...structuredClone(source), id: `${source.id}-copy-${Date.now()}`, time });
+  next.keyframes.push({ ...structuredClone(source), id: `${source.id}-copy-${Date.now()}`, time, origin: source.origin ? "manual" : undefined });
   return next;
 }
 
 export function updatePose(project: Project, frameId: string, boneId: string, patch: Partial<Transform>): Project {
   const next = cloneProject(project);
   const frame = next.keyframes.find((item) => item.id === frameId);
-  if (frame) Object.assign(frame.pose[boneId], patch);
+  if (frame) {
+    Object.assign(frame.pose[boneId], patch);
+    if (frame.origin) frame.origin = "manual";
+  }
   return next;
 }
 

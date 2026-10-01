@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, addWeightKey, bakeAction, evaluateWorld, exportAction, layerEnvelope, migrateProject, removeWeightKey, sampleLocal, shortestAngleDelta, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
+import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, evaluateWorld, exportAction, layerEnvelope, migrateProject, removeWeightKey, sampleLocal, shortestAngleDelta, updatePose, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -159,5 +159,62 @@ describe("animation core", () => {
     expect(legacy.version).toBe(1);
     expect(legacy.actions).toEqual([]);
     expect(legacy.layers?.[0].weight_keys).toEqual([]);
+  });
+
+  it("bakes layers with smooth weight transition keyframes", () => {
+    let project = addWeightKey(defaultProject, "layer-wave", 0.2, 0);
+    project = addWeightKey(project, "layer-wave", 0.5, 1);
+    project = addWeightKey(project, "layer-wave", 0.9, 0.3);
+    const bones = project.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(project, 0.15, 1.05, bones, "过渡");
+    expect(validateProject({ ...project, actions: [action] })).toHaveLength(0);
+    action.keyframes.forEach((frame) => {
+      const sourcePose = sampleLocal(project, 0.15 + frame.time);
+      expect(frame.origin).toBe("baked");
+      ["upper_arm_r", "forearm_r"].forEach((boneId) => {
+        expect(Math.abs(shortestAngleDelta(frame.pose[boneId].rotation, sourcePose[boneId].rotation))).toBeLessThan(1e-6);
+      });
+    });
+  });
+
+  it("analyzes affected segments and applies partial rebake with manual handling", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(defaultProject, 0, 1.2, bones, "片段");
+    let project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [action] };
+    // manual retouch on the action is flagged via updatePose on the action view
+    const actionView = { ...project, duration: action.duration, keyframes: action.keyframes, layers: [] };
+    const retouched = updatePose(actionView as never, action.keyframes[10].id, "spine", { rotation: 45 });
+    expect(retouched.keyframes[10].origin).toBe("manual");
+    const edited = structuredClone(project);
+    edited.actions = [{ ...action, keyframes: retouched.keyframes }];
+    edited.version = 2;
+    edited.keyframes[1].pose.spine.rotation = 9;
+    const segments = analyzeRebake(edited, edited.actions![0]);
+    expect(segments.length).toBeGreaterThan(0);
+    expect(segments.some((segment) => segment.manual)).toBe(true);
+    const manualSegment = segments.find((segment) => segment.manual)!;
+    const decisions = segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: (segment === manualSegment ? "keep" : "source") as "keep" | "source",
+    }));
+    const next = applyRebake(edited, edited.actions![0].id, decisions.filter((d) => d.resolution === "source"));
+    const updated = next.actions![0];
+    expect(updated.revision).toBe(2);
+    expect(updated.previous_versions).toHaveLength(1);
+    const kept = updated.keyframes.filter((frame) => frame.origin === "manual");
+    expect(kept).toHaveLength(1);
+    expect(kept[0].pose.spine.rotation).toBeCloseTo(45);
+    updated.keyframes.filter((frame) => frame.origin === "baked").forEach((frame) => {
+      const sourcePose = sampleLocal(edited, frame.time);
+      expect(Math.abs(shortestAngleDelta(frame.pose.spine.rotation, sourcePose.spine.rotation))).toBeLessThan(1e-6);
+    });
+    const remaining = analyzeRebake(edited, updated);
+    expect(remaining.every((segment) => segment.manual)).toBe(true);
+    const final = applyRebake({ ...edited, actions: [updated] }, updated.id, remaining.map((segment) => ({
+      segment: { start: segment.start, end: segment.end }, resolution: "source" as const,
+    })));
+    expect(analyzeRebake(edited, final.actions![0])).toHaveLength(0);
+    expect(final.actions![0].source.source_version).toBe(2);
+    expect(validateProject(final)).toHaveLength(0);
   });
 });

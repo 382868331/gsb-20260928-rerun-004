@@ -92,3 +92,8 @@ select, input[type="number"] { border: 1px solid #d3dcea; border-radius: 9px; pa
 .weight-key { display: inline-flex; align-items: center; gap: 4px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 999px; padding: 2px 8px; }
 .weight-key input[type="number"] { width: 64px; }
 .weight-key input[type="range"] { width: 90px; }
+.rebake-panel { margin-top: 10px; border-top: 1px dashed #3a4a6b; padding-top: 10px; display: grid; gap: 8px; }
+.rebake-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 13px; }
+.rebake-row.manual { color: #f0b45c; }
+.rebake-choice { display: inline-flex; gap: 10px; align-items: center; }
+.rebake-choice em { font-style: normal; opacity: 0.85; }

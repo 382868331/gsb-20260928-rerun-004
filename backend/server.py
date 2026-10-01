@@ -8,6 +8,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from animation_core import (
+    analyze_rebake,
+    apply_rebake,
     bake_action,
     default_project,
     evaluate_world,
@@ -87,6 +89,25 @@ class AnimationHandler(BaseHTTPRequestHandler):
                         payload.get("action_id"),
                     )
                     self.end_json({"ok": True, "action": action})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/rebake":
+                try:
+                    project = payload["project"]
+                    action_id = str(payload["action_id"])
+                    action = next(
+                        (item for item in project.get("actions", []) if item.get("id") == action_id),
+                        None,
+                    )
+                    if action is None:
+                        self.end_json({"errors": [f"找不到整理动作 {action_id}"]}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if "decisions" in payload:
+                        updated = apply_rebake(project, action_id, list(payload.get("decisions", [])))
+                        self.end_json({"ok": True, "action": updated})
+                    else:
+                        self.end_json({"ok": True, "segments": analyze_rebake(project, action)})
                 except (KeyError, TypeError, ValueError) as exc:
                     self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
                 return
