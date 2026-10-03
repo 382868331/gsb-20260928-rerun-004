@@ -9,15 +9,22 @@ from urllib.parse import parse_qs, urlparse
 
 from animation_core import (
     analyze_rebake,
+    analyze_shared_rebake,
+    analyze_withdraw,
     apply_rebake,
     bake_action,
+    compare_action_variants,
+    create_plan,
     default_project,
+    delete_plan,
     evaluate_world,
     export_action,
     load_project,
+    publish_plan,
     sample_local,
     save_project,
     validate_project,
+    withdraw_decision,
 )
 
 
@@ -108,6 +115,62 @@ class AnimationHandler(BaseHTTPRequestHandler):
                         self.end_json({"ok": True, "action": updated})
                     else:
                         self.end_json({"ok": True, "segments": analyze_rebake(project, action)})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/rebake/all":
+                try:
+                    self.end_json({"ok": True, "actions": analyze_shared_rebake(payload["project"])})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/rebake/withdraw":
+                try:
+                    project = payload["project"]
+                    action_id = str(payload["action_id"])
+                    decision_id = str(payload["decision_id"])
+                    if payload.get("apply"):
+                        updated = withdraw_decision(project, action_id, decision_id)
+                        self.end_json({"ok": True, "action": updated})
+                    else:
+                        self.end_json({"ok": True, "preview": analyze_withdraw(project, action_id, decision_id)})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/plans":
+                try:
+                    updated = create_plan(
+                        payload["project"],
+                        str(payload["action_id"]),
+                        str(payload.get("name", "")),
+                        list(payload.get("decisions", [])),
+                    )
+                    self.end_json({"ok": True, "action": updated})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/plans/compare":
+                try:
+                    report = compare_action_variants(
+                        payload["project"],
+                        str(payload["action_id"]),
+                        payload.get("plan_ids"),
+                    )
+                    self.end_json({"ok": True, "report": report})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/plans/publish":
+                try:
+                    updated = publish_plan(payload["project"], str(payload["action_id"]), str(payload["plan_id"]))
+                    self.end_json({"ok": True, "action": updated})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/plans/delete":
+                try:
+                    updated = delete_plan(payload["project"], str(payload["action_id"]), str(payload["plan_id"]))
+                    self.end_json({"ok": True, "action": updated})
                 except (KeyError, TypeError, ValueError) as exc:
                     self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
                 return

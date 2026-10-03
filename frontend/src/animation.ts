@@ -5,7 +5,13 @@ export type Bone = {
   parent: string | null;
   rest: { x: number; y: number };
 };
-export type Keyframe = { id: string; time: number; pose: Record<string, Transform>; origin?: "baked" | "manual" };
+export type Keyframe = {
+  id: string;
+  time: number;
+  pose: Record<string, Transform>;
+  origin?: "baked" | "manual";
+  kept_source_version?: number;
+};
 export type Layer = {
   id: string;
   name: string;
@@ -30,6 +36,34 @@ export type BakedSource = {
   updated_at?: string;
 };
 export type ActionRevision = { revision: number; keyframes: Keyframe[]; saved_at: string };
+export type DecisionSegment = {
+  start: number;
+  end: number;
+  resolution: "source" | "keep";
+  bones: string[];
+  manual: boolean;
+};
+export type DecisionEntry = {
+  id: string;
+  revision: number;
+  source_version: number;
+  applied_at: string;
+  segments: DecisionSegment[];
+  frames: Keyframe[];
+  plan_id?: string;
+};
+export type RebakePlan = {
+  id: string;
+  name: string;
+  created_at: string;
+  base_revision: number;
+  source_version: number;
+  decisions: DecisionSegment[];
+  keyframes: Keyframe[];
+  published: boolean;
+  published_revision?: number;
+};
+export type WithdrawalRecord = { withdrawn_ids: string[]; revision: number; at: string };
 export type Action = {
   id: string;
   name: string;
@@ -38,6 +72,9 @@ export type Action = {
   layers?: Layer[];
   revision?: number;
   previous_versions?: ActionRevision[];
+  plans?: RebakePlan[];
+  decision_log?: DecisionEntry[];
+  withdrawals?: WithdrawalRecord[];
   source: BakedSource;
 };
 export type Project = {
@@ -178,6 +215,19 @@ export function validateProject(project: Project): string[] {
     if (!source?.bones.length) errors.push(`${prefix}缺少整理骨骼范围`);
     else source.bones.forEach((boneId) => {
       if (!byId.has(boneId)) errors.push(`${prefix}的整理骨骼范围包含未知骨骼 ${boneId}`);
+    });
+    const planIds = new Set<string>();
+    (action.plans ?? []).forEach((plan) => {
+      if (!plan.id) errors.push(`${prefix}的方案缺少有效 id`);
+      else if (planIds.has(plan.id)) errors.push(`${prefix}的方案 id 重复：${plan.id}`);
+      planIds.add(plan.id);
+      if (!plan.keyframes?.length) errors.push(`${prefix}的方案 ${plan.id} 缺少预览关键帧`);
+    });
+    const decisionIds = new Set<string>();
+    (action.decision_log ?? []).forEach((entry) => {
+      if (!entry.id) errors.push(`${prefix}的采用记录缺少有效 id`);
+      else if (decisionIds.has(entry.id)) errors.push(`${prefix}的采用记录 id 重复：${entry.id}`);
+      decisionIds.add(entry.id);
     });
     errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`));
   });
@@ -385,10 +435,13 @@ export function bakeAction(
     id,
     name: name || `整理动作 ${rangeStart}~${rangeEnd}s`,
     duration: span,
-    keyframes,
+   keyframes,
     layers: [],
     revision: 1,
     previous_versions: [],
+    plans: [],
+    decision_log: [],
+    withdrawals: [],
     source: {
       action_id: "__main__",
       source_version: project.version,
@@ -417,14 +470,17 @@ export function migrateProject(project: Project): Project {
   if (!Number.isInteger(next.version)) next.version = 1;
   if (!next.actions) next.actions = [];
   (next.layers ?? []).forEach((layer) => { if (!layer.weight_keys) layer.weight_keys = []; });
-  next.actions.forEach((action) => {
-    if (!Number.isInteger(action.revision)) action.revision = 1;
-    if (!action.previous_versions) action.previous_versions = [];
-  });
+ next.actions.forEach((action) => {
+   if (!Number.isInteger(action.revision)) action.revision = 1;
+   if (!action.previous_versions) action.previous_versions = [];
+    if (!action.plans) action.plans = [];
+    if (!action.decision_log) action.decision_log = [];
+    if (!action.withdrawals) action.withdrawals = [];
+ });
   return next;
 }
 
-export type RebakeSegment = { start: number; end: number; bones: string[]; manual: boolean };
+export type RebakeSegment = { start: number; end: number; bones: string[]; manual: boolean; acknowledged?: boolean };
 
 const transformDiffers = (a: Transform, b: Transform, tolerance = 1e-7) =>
   Math.abs(a.x - b.x) > tolerance
@@ -436,7 +492,7 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
   const span = action.duration;
   const count = Math.round(span * fps) + 1;
   const keyframeByIndex = new Map(action.keyframes.map((frame) => [Math.round(frame.time * fps), frame]));
-  const cells: { index: number; time: number; bones: string[]; manual: boolean }[] = [];
+  const cells: { index: number; time: number; bones: string[]; manual: boolean; acknowledged: boolean }[] = [];
   for (let index = 0; index < count; index += 1) {
     const localTime = Math.min(index / fps, span);
     const sourcePose = sampleLocal(project, rangeStart + localTime);
@@ -444,51 +500,112 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
     const differing = bones.filter((boneId) => sourcePose[boneId] && bakedPose[boneId]
       && transformDiffers(sourcePose[boneId], bakedPose[boneId]));
     if (differing.length === 0) continue;
-    cells.push({ index, time: localTime, bones: differing, manual: keyframeByIndex.get(index)?.origin === "manual" });
+    const keyframe = keyframeByIndex.get(index);
+    const manual = keyframe?.origin === "manual";
+    const acknowledged = manual && keyframe?.kept_source_version === project.version;
+    cells.push({ index, time: localTime, bones: differing, manual, acknowledged });
   }
-  const segments: (RebakeSegment & { lastIndex: number })[] = [];
+  const segments: (RebakeSegment & { lastIndex: number; ack: boolean })[] = [];
   cells.forEach((cell) => {
     const last = segments[segments.length - 1];
     if (last && cell.index === last.lastIndex + 1 && cell.manual === last.manual) {
       last.lastIndex = cell.index;
       last.end = cell.time;
       last.bones = [...new Set([...last.bones, ...cell.bones])].sort();
+      last.ack = last.ack && cell.acknowledged;
     } else {
-      segments.push({ lastIndex: cell.index, start: cell.time, end: cell.time, bones: [...cell.bones], manual: cell.manual });
+      segments.push({ lastIndex: cell.index, ack: cell.acknowledged, start: cell.time, end: cell.time, bones: [...cell.bones], manual: cell.manual });
     }
   });
-  return segments.map(({ start, end, bones: segmentBones, manual }) => ({ start, end, bones: segmentBones, manual }));
+  return segments.map(({ start, end, bones: segmentBones, manual, ack }) => ({ start, end, bones: segmentBones, manual, acknowledged: ack && manual }));
 }
 
 export type RebakeDecision = { segment: { start: number; end: number }; resolution: "source" | "keep" };
 
-export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[]): Project {
-  const action = project.actions?.find((item) => item.id === actionId);
-  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
-  const adopted = decisions.filter((decision) => decision.resolution === "source");
-  if (adopted.length === 0) throw new Error("没有需要应用的返修区间");
+export function analyzeSharedRebake(project: Project) {
+  return (project.actions ?? [])
+    .map((action) => ({ action, segments: analyzeRebake(project, action) }))
+    .filter((entry) => entry.segments.length > 0)
+    .map((entry) => ({
+      action_id: entry.action.id,
+      name: entry.action.name,
+      revision: entry.action.revision ?? 1,
+      source_version: entry.action.source.source_version,
+      current_source_version: project.version,
+      segments: entry.segments,
+    }));
+}
+
+function normalizeDecisions(project: Project, action: Action, decisions: RebakeDecision[]): DecisionSegment[] {
+  const span = action.duration;
+  const analysis = analyzeRebake(project, action);
+  return decisions.map((decision) => {
+    const start = Number(decision.segment.start);
+    const end = Number(decision.segment.end);
+    if (!(end >= start) || start < -1e-9 || end > span + 1e-9) throw new Error(`返修区间 ${start}~${end}s 无效`);
+    const match = analysis.find((segment) => Math.abs(segment.start - start) < 1e-6 && Math.abs(segment.end - end) < 1e-6);
+    return {
+      start: Math.max(0, start),
+      end: Math.min(end, span),
+      resolution: decision.resolution,
+      bones: match ? [...match.bones] : [...action.source.bones],
+      manual: match ? match.manual : false,
+    };
+  });
+}
+
+function computeRebake(
+  project: Project,
+  action: Action,
+  normalized: DecisionSegment[],
+  revision: number,
+): { keyframes: Keyframe[]; adoptedFrames: Keyframe[] } {
   const { fps, range_start: rangeStart, bones } = action.source;
   const span = action.duration;
   let keyframes = action.keyframes.map((frame) => ({ ...frame, pose: structuredClone(frame.pose) }));
-  const revision = (action.revision ?? 1) + 1;
-  adopted.forEach(({ segment }) => {
+  const adoptedFrames: Keyframe[] = [];
+  normalized.forEach((segment) => {
     const { start, end } = segment;
-    if (!(end >= start) || start < -1e-9 || end > span + 1e-9) throw new Error(`返修区间 ${start}~${end}s 无效`);
+    if (segment.resolution === "keep") {
+      if (segment.manual) {
+        keyframes.forEach((frame) => {
+          if (frame.time >= start - 1e-9 && frame.time <= end + 1e-9 && frame.origin === "manual") {
+            frame.kept_source_version = project.version;
+          }
+        });
+      }
+      return;
+    }
     keyframes = keyframes.filter((frame) => frame.time < start - 1e-9 || frame.time > end + 1e-9);
     const firstIndex = Math.ceil(start * fps - 1e-9);
     const lastIndex = Math.floor(end * fps + 1e-9);
     for (let index = firstIndex; index <= lastIndex; index += 1) {
       const localTime = Math.min(index / fps, span);
       const sourcePose = sampleLocal(project, rangeStart + localTime);
-      keyframes.push({
-        id: `${actionId}-r${revision}-kf-${index}`,
+      const frame: Keyframe = {
+        id: `${action.id}-r${revision}-kf-${index}`,
         time: Math.round(localTime * 1e9) / 1e9,
         pose: Object.fromEntries(bones.map((boneId) => [boneId, { ...sourcePose[boneId] }])),
         origin: "baked",
-      });
+      };
+      keyframes.push(frame);
+      adoptedFrames.push(structuredClone(frame));
     }
   });
   keyframes.sort((a, b) => a.time - b.time);
+  return { keyframes, adoptedFrames };
+}
+
+export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[]): Project {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  if (decisions.length === 0) throw new Error("没有需要应用的返修区间");
+  const normalized = normalizeDecisions(project, action, decisions);
+  const adopted = normalized.filter((segment) => segment.resolution === "source");
+  const keeps = normalized.filter((segment) => segment.resolution === "keep" && segment.manual);
+  if (adopted.length === 0 && keeps.length === 0) throw new Error("没有需要应用的返修区间");
+  const revision = (action.revision ?? 1) + 1;
+  const { keyframes, adoptedFrames } = computeRebake(project, action, normalized, revision);
   const updated: Action = {
     ...structuredClone(action),
     keyframes,
@@ -498,11 +615,284 @@ export function applyRebake(project: Project, actionId: string, decisions: Rebak
       { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
     ],
     source: { ...action.source, updated_at: new Date().toISOString() },
+    decision_log: [
+      ...(action.decision_log ?? []),
+      {
+        id: `${actionId}-d${revision}`,
+        revision,
+        source_version: project.version,
+        applied_at: new Date().toISOString(),
+        segments: normalized,
+        frames: adoptedFrames,
+      },
+    ],
   };
   if (analyzeRebake(project, updated).length === 0) updated.source.source_version = project.version;
   return {
     ...project,
     actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)),
+  };
+}
+
+const replaceAction = (project: Project, updated: Action): Project => ({
+  ...project,
+  actions: (project.actions ?? []).map((item) => (item.id === updated.id ? updated : item)),
+});
+
+const requireAction = (project: Project, actionId: string): Action => {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  return action;
+};
+
+export function createPlan(project: Project, actionId: string, name: string, decisions: RebakeDecision[]): Project {
+  const action = requireAction(project, actionId);
+  if (decisions.length === 0) throw new Error("方案至少需要一条采用决定");
+  const normalized = normalizeDecisions(project, action, decisions);
+  if (!normalized.some((segment) => segment.resolution === "source" || segment.manual)) {
+    throw new Error("方案不含任何采用或保留决定");
+  }
+  const revision = (action.revision ?? 1) + 1;
+  const { keyframes } = computeRebake(project, action, normalized, revision);
+  const plans = action.plans ?? [];
+  const plan: RebakePlan = {
+    id: `${actionId}-plan-${plans.length + 1}`,
+    name: name.trim() || `方案 ${plans.length + 1}`,
+    created_at: new Date().toISOString(),
+    base_revision: action.revision ?? 1,
+    source_version: project.version,
+    decisions: normalized,
+    keyframes,
+    published: false,
+  };
+  return replaceAction(project, { ...structuredClone(action), plans: [...plans, plan] });
+}
+
+export function deletePlan(project: Project, actionId: string, planId: string): Project {
+  const action = requireAction(project, actionId);
+  const plans = action.plans ?? [];
+  if (!plans.some((plan) => plan.id === planId)) throw new Error(`找不到方案 ${planId}`);
+  return replaceAction(project, { ...structuredClone(action), plans: plans.filter((plan) => plan.id !== planId) });
+}
+
+export function publishPlan(project: Project, actionId: string, planId: string): Project {
+  const action = requireAction(project, actionId);
+  const plan = (action.plans ?? []).find((item) => item.id === planId);
+  if (!plan) throw new Error(`找不到方案 ${planId}`);
+  if (plan.published) throw new Error(`方案「${plan.name}」已发布过`);
+  const revision = (action.revision ?? 1) + 1;
+  const adoptedWindows = plan.decisions.filter((segment) => segment.resolution === "source");
+  const adoptedFrames = plan.keyframes
+    .filter((frame) => adoptedWindows.some((segment) => frame.time >= segment.start - 1e-9 && frame.time <= segment.end + 1e-9))
+    .map((frame) => structuredClone(frame));
+  const updated: Action = {
+    ...structuredClone(action),
+    keyframes: structuredClone(plan.keyframes),
+    revision,
+    previous_versions: [
+      ...(action.previous_versions ?? []),
+      { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
+    ],
+    source: { ...action.source, updated_at: new Date().toISOString() },
+    decision_log: [
+      ...(action.decision_log ?? []),
+      {
+        id: `${actionId}-d${revision}`,
+        revision,
+        source_version: plan.source_version,
+        applied_at: new Date().toISOString(),
+        segments: plan.decisions.map((segment) => ({ ...segment })),
+        frames: adoptedFrames,
+        plan_id: planId,
+      },
+    ],
+    plans: (action.plans ?? []).map((item) => (item.id === planId ? { ...item, published: true, published_revision: revision } : item)),
+  };
+  if (analyzeRebake(project, updated).length === 0) updated.source.source_version = project.version;
+  return replaceAction(project, updated);
+}
+
+const segmentsOverlap = (a: DecisionSegment, b: DecisionSegment) =>
+  Math.min(a.end, b.end) - Math.max(a.start, b.start) > 1e-9
+  && a.bones.some((boneId) => b.bones.includes(boneId));
+
+function withdrawClosure(log: DecisionEntry[], decisionId: string) {
+  const target = log.find((entry) => entry.id === decisionId);
+  if (!target) throw new Error(`找不到采用决定 ${decisionId}`);
+  const withdrawn = new Set<string>([decisionId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    log.forEach((entry) => {
+      if (withdrawn.has(entry.id) || entry.revision <= target.revision) return;
+      const dependent = log.some((other) => withdrawn.has(other.id)
+        && entry.segments.some((segA) => other.segments.some((segB) => segmentsOverlap(segA, segB))));
+      if (dependent) {
+        withdrawn.add(entry.id);
+        changed = true;
+      }
+    });
+  }
+  const independent = log.filter((entry) => !withdrawn.has(entry.id) && entry.revision > target.revision);
+  return { target, withdrawn, independent };
+}
+
+export function analyzeWithdraw(project: Project, actionId: string, decisionId: string) {
+  const action = requireAction(project, actionId);
+  const log = action.decision_log ?? [];
+  const { target, withdrawn, independent } = withdrawClosure(log, decisionId);
+  return {
+    target,
+    dependents: log.filter((entry) => withdrawn.has(entry.id) && entry.id !== decisionId),
+    independent,
+    withdrawn_ids: [...withdrawn].sort(),
+    base_revision: target.revision - 1,
+  };
+}
+
+export function withdrawDecision(project: Project, actionId: string, decisionId: string): Project {
+  const action = requireAction(project, actionId);
+  const log = action.decision_log ?? [];
+  const { target, withdrawn } = withdrawClosure(log, decisionId);
+  const baseRevision = target.revision - 1;
+  const snapshot = (action.previous_versions ?? []).find((item) => item.revision === baseRevision);
+  if (!snapshot) throw new Error(`缺少修订 r${baseRevision} 的快照，无法安全撤回`);
+  let keyframes = snapshot.keyframes.map((frame) => ({ ...frame, pose: structuredClone(frame.pose) }));
+  log.forEach((entry) => {
+    if (withdrawn.has(entry.id) || entry.revision <= baseRevision) return;
+    entry.segments.forEach((segment) => {
+      if (segment.resolution === "source") {
+        keyframes = keyframes.filter((frame) => frame.time < segment.start - 1e-9 || frame.time > segment.end + 1e-9);
+        keyframes.push(...entry.frames.map((frame) => structuredClone(frame)));
+      } else if (segment.manual) {
+        keyframes.forEach((frame) => {
+          if (frame.time >= segment.start - 1e-9 && frame.time <= segment.end + 1e-9 && frame.origin === "manual") {
+            frame.kept_source_version = entry.source_version;
+          }
+        });
+      }
+    });
+  });
+  keyframes.sort((a, b) => a.time - b.time);
+  const revision = (action.revision ?? 1) + 1;
+  const updated: Action = {
+    ...structuredClone(action),
+    keyframes,
+    revision,
+    previous_versions: [
+      ...(action.previous_versions ?? []),
+      { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
+    ],
+    decision_log: log.filter((entry) => !withdrawn.has(entry.id)),
+    withdrawals: [
+      ...(action.withdrawals ?? []),
+      { withdrawn_ids: [...withdrawn].sort(), revision, at: new Date().toISOString() },
+    ],
+  };
+  return replaceAction(project, updated);
+}
+
+export type CompareReport = {
+  action_id: string;
+  fps: number;
+  span: number;
+  source_version: number;
+  variants: { id: string; kind: string; label: string; decisions: DecisionSegment[]; source_version?: number }[];
+  diffs: { a: string; b: string; frames: { time: number; bones: { bone: string; origin: "source" | "manual" }[] }[] }[];
+  continuity: { variant: string; label: string; boundary: number; bone: string; delta: number }[];
+};
+
+export function compareActionVariants(project: Project, actionId: string, planIds?: string[]): CompareReport {
+  const action = requireAction(project, actionId);
+  const { fps, range_start: rangeStart, bones } = action.source;
+  const span = action.duration;
+  const count = Math.round(span * fps) + 1;
+  type Variant = { id: string; kind: string; label: string; keyframes: Keyframe[]; decisions: DecisionSegment[]; source_version?: number };
+  const variants: Variant[] = [{
+    id: "current",
+    kind: "current",
+    label: `当前 r${action.revision ?? 1}`,
+    keyframes: action.keyframes,
+    decisions: [],
+  }];
+  (action.previous_versions ?? []).forEach((item) => variants.push({
+    id: `r${item.revision}`,
+    kind: "revision",
+    label: `历史 r${item.revision}`,
+    keyframes: item.keyframes,
+    decisions: [],
+  }));
+  (action.plans ?? [])
+    .filter((plan) => !planIds || planIds.includes(plan.id))
+    .forEach((plan) => variants.push({
+      id: plan.id,
+      kind: "plan",
+      label: plan.name,
+      keyframes: plan.keyframes,
+      decisions: plan.decisions,
+      source_version: plan.source_version,
+    }));
+  const sourcePoses = Array.from({ length: count }, (_, index) => sampleLocal(project, rangeStart + Math.min(index / fps, span)));
+  const variantPoses = new Map(variants.map((variant) => [
+    variant.id,
+    Array.from({ length: count }, (_, index) => sampleFrames(variant.keyframes, Math.min(index / fps, span))),
+  ]));
+  const diffFrames = (a: string, b: string) => {
+    const posesA = variantPoses.get(a)!;
+    const posesB = variantPoses.get(b)!;
+    const frames: CompareReport["diffs"][number]["frames"] = [];
+    for (let index = 0; index < count; index += 1) {
+      const entries: { bone: string; origin: "source" | "manual" }[] = [];
+      bones.forEach((boneId) => {
+        const pa = posesA[index][boneId];
+        const pb = posesB[index][boneId];
+        if (!pa || !pb || !transformDiffers(pa, pb)) return;
+        const sourcePose = sourcePoses[index][boneId];
+        entries.push({ bone: boneId, origin: sourcePose && !transformDiffers(pb, sourcePose) ? "source" : "manual" });
+      });
+      if (entries.length > 0) frames.push({ time: Math.min(index / fps, span), bones: entries });
+    }
+    return frames;
+  };
+  const diffs: CompareReport["diffs"] = variants
+    .filter((variant) => variant.id !== "current")
+    .map((variant) => ({ a: "current", b: variant.id, frames: diffFrames("current", variant.id) }));
+  const planVariants = variants.filter((variant) => variant.kind === "plan");
+  if (planVariants.length === 2) {
+    diffs.push({ a: planVariants[0].id, b: planVariants[1].id, frames: diffFrames(planVariants[0].id, planVariants[1].id) });
+  }
+  const continuity: CompareReport["continuity"] = [];
+  variants.forEach((variant) => {
+    const poses = variantPoses.get(variant.id)!;
+    variant.decisions.filter((segment) => segment.resolution === "source").forEach((segment) => {
+      [
+        { boundary: segment.start, outside: Math.ceil(segment.start * fps - 1e-9) - 1 },
+        { boundary: segment.end, outside: Math.floor(segment.end * fps + 1e-9) + 1 },
+      ].forEach(({ boundary, outside }) => {
+        const inside = boundary === segment.start ? outside + 1 : outside - 1;
+        if (outside < 0 || outside >= count || inside < 0 || inside >= count) return;
+        (segment.bones.length ? segment.bones : bones).forEach((boneId) => {
+          const pin = poses[inside][boneId];
+          const pout = poses[outside][boneId];
+          if (!pin || !pout) return;
+          const delta = Math.max(
+            Math.abs(shortestAngleDelta(pout.rotation, pin.rotation)),
+            Math.abs(pin.x - pout.x),
+            Math.abs(pin.y - pout.y),
+          );
+          if (delta > 1e-6) continuity.push({ variant: variant.id, label: variant.label, boundary, bone: boneId, delta });
+        });
+      });
+    });
+  });
+  return {
+    action_id: actionId,
+    fps,
+    span,
+    source_version: project.version,
+    variants: variants.map(({ keyframes: _keyframes, ...rest }) => rest),
+    diffs,
+    continuity,
   };
 }
 

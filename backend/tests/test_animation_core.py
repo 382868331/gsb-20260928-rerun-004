@@ -6,18 +6,26 @@ from pathlib import Path
 
 from animation_core import (
     analyze_rebake,
+    analyze_shared_rebake,
+    analyze_withdraw,
     apply_rebake,
     bake_action,
+    compare_action_variants,
+    create_plan,
     default_project,
+    delete_plan,
     evaluate_world,
     export_action,
     layer_envelope,
     load_project,
     migrate_project,
+    publish_plan,
     sample_local,
+    save_project,
     weight_key_multiplier,
     shortest_angle_delta,
     validate_project,
+    withdraw_decision,
 )
 
 
@@ -274,6 +282,203 @@ class AnimationCoreTests(unittest.TestCase):
         self.assertEqual(len(final["previous_versions"]), 2)
         round_trip = json.loads(json.dumps({**project, "actions": [final]}))
         self.assertEqual(validate_project(round_trip), [])
+
+
+class SharedSourceRebakeTests(unittest.TestCase):
+    def _project_with_two_actions(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        walk = bake_action(project, 0.0, 1.2, bone_ids, "走路整理", action_id="walk")
+        turn = bake_action(project, 0.0, 1.2, bone_ids, "转身整理", action_id="turn")
+        # each action already has its own manual retouch on a different bone
+        walk["keyframes"][10]["pose"]["spine"]["rotation"] = 45.0
+        walk["keyframes"][10]["origin"] = "manual"
+        turn["keyframes"][20]["pose"]["upper_arm_r"]["rotation"] = 90.0
+        turn["keyframes"][20]["origin"] = "manual"
+        project["actions"] = [walk, turn]
+        return project, bone_ids
+
+    def test_shared_source_reports_each_action_independently(self):
+        project, _ = self._project_with_two_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        overview = analyze_shared_rebake(project)
+        self.assertEqual({item["action_id"] for item in overview}, {"walk", "turn"})
+        for item in overview:
+            self.assertEqual(item["source_version"], 1)
+            self.assertEqual(item["current_source_version"], 2)
+            self.assertTrue(all("spine" in segment["bones"] for segment in item["segments"]))
+        # adopting on one action must not touch the other
+        walk_segments = next(item for item in overview if item["action_id"] == "walk")["segments"]
+        decisions = [
+            {"segment": {"start": s["start"], "end": s["end"]},
+             "resolution": "keep" if s["manual"] else "source"}
+            for s in walk_segments
+        ]
+        updated_walk = apply_rebake(project, "walk", decisions)
+        project["actions"][0] = updated_walk
+        turn_after = project["actions"][1]
+        self.assertEqual(turn_after["revision"], 1)
+        self.assertTrue(analyze_rebake(project, turn_after))
+        self.assertEqual(len(turn_after["decision_log"]), 0)
+
+    def test_kept_manual_frames_attach_to_source_version_and_reflag_later(self):
+        project, _ = self._project_with_two_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        walk = project["actions"][0]
+        manual_segment = next(s for s in analyze_rebake(project, walk) if s["manual"])
+        updated = apply_rebake(project, "walk", [
+            {"segment": {"start": manual_segment["start"], "end": manual_segment["end"]}, "resolution": "keep"},
+        ])
+        kept = [f for f in updated["keyframes"] if f.get("origin") == "manual"]
+        self.assertTrue(kept)
+        self.assertTrue(all(f.get("kept_source_version") == 2 for f in kept))
+        acknowledged = analyze_rebake(project, updated)
+        self.assertTrue(all(segment["acknowledged"] for segment in acknowledged if segment["manual"]))
+        # a newer source edit re-flags the same kept frames as a conflict
+        project["actions"][0] = updated
+        project["version"] = 3
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 12.0
+        reflagged = analyze_rebake(project, project["actions"][0])
+        manual_segments = [s for s in reflagged if s["manual"]]
+        self.assertTrue(manual_segments)
+        self.assertTrue(any(not s["acknowledged"] for s in manual_segments))
+
+    def test_plans_compare_publish_and_keep_other_plan_editable(self):
+        project, _ = self._project_with_two_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        walk = project["actions"][0]
+        segments = analyze_rebake(project, walk)
+        manual_segment = next(s for s in segments if s["manual"])
+        other_segments = [s for s in segments if not s["manual"]]
+        # plan A: keep the manual wrist/spine fix, adopt the rest
+        plan_a_decisions = [
+            {"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in other_segments
+        ] + [{"segment": {"start": manual_segment["start"], "end": manual_segment["end"]}, "resolution": "keep"}]
+        # plan B: adopt the full new source everywhere
+        plan_b_decisions = [
+            {"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in segments
+        ]
+        walk = create_plan(project, "walk", "保留手工修正", plan_a_decisions)
+        project["actions"][0] = walk
+        walk = create_plan(project, "walk", "完整新上身", plan_b_decisions)
+        project["actions"][0] = walk
+        self.assertEqual(len(walk["plans"]), 2)
+        self.assertEqual(walk["revision"], 1)  # plans never touch the action
+        self.assertEqual(validate_project(project), [])
+
+        report = compare_action_variants(project, "walk")
+        self.assertEqual(len([v for v in report["variants"] if v["kind"] == "plan"]), 2)
+        plan_diff = next(d for d in report["diffs"] if d["a"] != "current")
+        self.assertTrue(plan_diff["frames"])
+        # plan A keeps the manual frame: its diff vs current is source-driven only
+        plan_a_id = walk["plans"][0]["id"]
+        diff_a = next(d for d in report["diffs"] if d["b"] == plan_a_id)
+        origins = {entry["origin"] for frame in diff_a["frames"] for entry in frame["bones"]}
+        self.assertEqual(origins, {"source"})
+
+        published = publish_plan(project, "walk", plan_a_id)
+        self.assertEqual(published["revision"], 2)
+        self.assertEqual(len(published["previous_versions"]), 1)
+        self.assertEqual(len(published["decision_log"]), 1)
+        self.assertEqual(published["decision_log"][0]["plan_id"], plan_a_id)
+        self.assertTrue(published["plans"][0]["published"])
+        self.assertFalse(published["plans"][1]["published"])  # still editable
+        kept = [f for f in published["keyframes"] if f.get("origin") == "manual"]
+        self.assertTrue(kept)
+        # old published revision still playable
+        old = published["previous_versions"][0]
+        self.assertEqual(old["revision"], 1)
+        self.assertTrue(old["keyframes"])
+        with self.assertRaises(ValueError):
+            publish_plan({**project, "actions": [published]}, "walk", plan_a_id)
+        # deleting the other plan keeps the published one
+        cleaned = delete_plan({**project, "actions": [published]}, "walk", walk["plans"][1]["id"])
+        self.assertEqual(len(cleaned["plans"]), 1)
+
+    def test_withdraw_shows_dependents_and_preserves_independent(self):
+        project, _ = self._project_with_two_actions()
+        walk = project["actions"][0]
+        # first source revision affects spine around t=0.16
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        segments = analyze_rebake(project, walk)
+        non_manual = [s for s in segments if not s["manual"]]
+        first = apply_rebake(project, "walk", [
+            {"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in non_manual
+        ])
+        project["actions"][0] = first
+        # second source revision affects a disjoint bone (head) later in time
+        project["version"] = 3
+        project["keyframes"][1]["pose"]["head"] = {"x": 5.0, "y": -48.0, "rotation": 30.0}
+        second_segments = [s for s in analyze_rebake(project, first) if "head" in s["bones"]]
+        self.assertTrue(second_segments)
+        second = apply_rebake(project, "walk", [
+            {"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in second_segments
+        ])
+        project["actions"][0] = second
+        self.assertEqual(len(second["decision_log"]), 2)
+
+        first_id = second["decision_log"][0]["id"]
+        preview = analyze_withdraw(project, "walk", first_id)
+        self.assertEqual(preview["dependents"], [])  # disjoint time/bones
+        self.assertEqual([e["id"] for e in preview["independent"]], [second["decision_log"][1]["id"]])
+
+        withdrawn = withdraw_decision(project, "walk", first_id)
+        self.assertEqual(len(withdrawn["decision_log"]), 1)
+        self.assertEqual(withdrawn["decision_log"][0]["id"], second["decision_log"][1]["id"])
+        self.assertEqual(len(withdrawn["withdrawals"]), 1)
+        # the independent later fix is still present: head still follows v3 source
+        head_pose = sample_local(project, 0.6)["head"]
+        from animation_core import sample_frames
+        pose = sample_frames(withdrawn["keyframes"], 0.6)
+        self.assertAlmostEqual(pose["head"]["rotation"], head_pose["rotation"], places=7)
+        # withdrawing a decision that a later one overlaps pulls the dependent too
+        project["version"] = 4
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 20.0
+        third_segments = [s for s in analyze_rebake(project, withdrawn) if "spine" in s["bones"] and not s["manual"]]
+        if third_segments:
+            third = apply_rebake(project, "walk", [
+                {"segment": {"start": s["start"], "end": s["end"]}, "resolution": "source"} for s in third_segments
+            ])
+            project["actions"][0] = third
+            earlier = third["decision_log"][0]["id"]
+            preview = analyze_withdraw(project, "walk", earlier)
+            overlapping = [e for e in third["decision_log"][1:]
+                           if any(set(seg["bones"]) & {"spine"} for seg in e["segments"])]
+            if overlapping:
+                self.assertTrue(preview["dependents"])
+
+    def test_shared_state_survives_save_and_reload(self):
+        import tempfile
+        project, _ = self._project_with_two_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        walk = project["actions"][0]
+        segments = analyze_rebake(project, walk)
+        walk = create_plan(project, "walk", "方案甲", [
+            {"segment": {"start": s["start"], "end": s["end"]},
+             "resolution": "keep" if s["manual"] else "source"} for s in segments
+        ])
+        project["actions"][0] = walk
+        published = publish_plan(project, "walk", walk["plans"][0]["id"])
+        project["actions"][0] = published
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "project.json"
+            save_project(path, project)
+            loaded = load_project(path)
+        loaded_walk = next(a for a in loaded["actions"] if a["id"] == "walk")
+        self.assertEqual(loaded_walk["plans"][0]["published"], True)
+        self.assertEqual(len(loaded_walk["decision_log"]), 1)
+        self.assertEqual(len(loaded_walk["previous_versions"]), 1)
+        self.assertEqual(loaded_walk["revision"], 2)
+        self.assertEqual(validate_project(loaded), [])
+        # withdrawal scope identical after reload
+        decision_id = loaded_walk["decision_log"][0]["id"]
+        preview = analyze_withdraw(loaded, "walk", decision_id)
+        self.assertEqual(preview["withdrawn_ids"], [decision_id])
 
 
 if __name__ == "__main__":

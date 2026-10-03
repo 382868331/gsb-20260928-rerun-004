@@ -364,6 +364,32 @@ def validate_project(project: dict[str, Any]) -> list[str]:
         previous_versions = action.get("previous_versions", [])
         if not isinstance(previous_versions, list):
             errors.append(f"{prefix}的历史版本必须是数组")
+        plans = action.get("plans", [])
+        if not isinstance(plans, list):
+            errors.append(f"{prefix}的方案列表必须是数组")
+        else:
+            plan_ids: set[str] = set()
+            for plan in plans:
+                if not isinstance(plan, dict) or not isinstance(plan.get("id"), str) or not plan["id"].strip():
+                    errors.append(f"{prefix}的方案缺少有效 id")
+                    continue
+                if plan["id"] in plan_ids:
+                    errors.append(f"{prefix}的方案 id 重复：{plan['id']}")
+                plan_ids.add(plan["id"])
+                if not isinstance(plan.get("keyframes"), list) or not plan["keyframes"]:
+                    errors.append(f"{prefix}的方案 {plan['id']} 缺少预览关键帧")
+        decision_log = action.get("decision_log", [])
+        if not isinstance(decision_log, list):
+            errors.append(f"{prefix}的采用记录必须是数组")
+        else:
+            decision_ids: set[str] = set()
+            for entry in decision_log:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"].strip():
+                    errors.append(f"{prefix}的采用记录缺少有效 id")
+                    continue
+                if entry["id"] in decision_ids:
+                    errors.append(f"{prefix}的采用记录 id 重复：{entry['id']}")
+                decision_ids.add(entry["id"])
         source = action.get("source")
         if not isinstance(source, dict):
             errors.append(f"{prefix}缺少来源溯源信息")
@@ -590,6 +616,9 @@ def bake_action(
         "layers": [],
         "revision": 1,
         "previous_versions": [],
+        "plans": [],
+        "decision_log": [],
+        "withdrawals": [],
         "source": {
             "action_id": "__main__",
             "source_version": source_version,
@@ -685,11 +714,14 @@ def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict
         if not differing:
             continue
         keyframe = keyframe_by_index.get(index)
+        manual = bool(keyframe is not None and keyframe.get("origin") == "manual")
+        acknowledged = manual and keyframe.get("kept_source_version") == int(project.get("version", 1))
         cells.append({
             "index": index,
             "time": local_time,
             "bones": differing,
-            "manual": bool(keyframe is not None and keyframe.get("origin") == "manual"),
+            "manual": manual,
+            "acknowledged": acknowledged,
         })
     segments: list[dict[str, Any]] = []
     for cell in cells:
@@ -700,9 +732,11 @@ def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict
             segment["end"] = cell["time"]
             segment["bones"] = sorted(set(segment["bones"]) | set(cell["bones"]))
             segment["manual"] = segment["manual"] or cell["manual"]
+            segment["_ack"] = segment["_ack"] and cell["acknowledged"]
         else:
             segments.append({
                 "_last_index": cell["index"],
+                "_ack": cell["acknowledged"],
                 "start": cell["time"],
                 "end": cell["time"],
                 "bones": list(cell["bones"]),
@@ -710,43 +744,109 @@ def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict
             })
     for segment in segments:
         segment.pop("_last_index")
+        segment["acknowledged"] = bool(segment.pop("_ack")) and segment["manual"]
     return segments
 
 
-def apply_rebake(
-    project: dict[str, Any],
-    action_id: str,
-    decisions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Apply per-segment rebake decisions to one action; returns the new action.
+def analyze_shared_rebake(project: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-action impact overview for every baked action sharing the source.
 
-    Each decision is {"segment": {"start", "end"}, "resolution": "source"|"keep"}.
-    "source" re-bakes that window from the current source project (replacing any
-    manual keyframes inside it); "keep" leaves the window untouched. Adjacent
-    untouched frames still equal the source pose, so neighbouring segments stay
-    pose-continuous. The previous keyframes are snapshotted so older revisions
-    remain playable after save/reload.
+    Each action keeps its own affected segments and decisions; nothing here
+    forces synchronisation between actions that share the same source.
     """
+    affected: list[dict[str, Any]] = []
+    for action in project.get("actions", []) or []:
+        if not isinstance(action, dict) or not isinstance(action.get("source"), dict):
+            continue
+        segments = analyze_rebake(project, action)
+        if not segments:
+            continue
+        affected.append({
+            "action_id": action.get("id"),
+            "name": action.get("name"),
+            "revision": int(action.get("revision", 1)),
+            "source_version": int(action["source"].get("source_version", 1)),
+            "current_source_version": int(project.get("version", 1)),
+            "segments": segments,
+        })
+    return affected
+
+
+def _find_action(project: dict[str, Any], action_id: str) -> dict[str, Any]:
     action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
     if action is None:
         raise ValueError(f"找不到整理动作 {action_id}")
-    source = action["source"]
-    fps = float(source.get("fps", 60.0))
-    range_start = float(source["range_start"])
+    return action
+
+
+def _normalize_decisions(
+    project: dict[str, Any],
+    action: dict[str, Any],
+    decisions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach bones/manual context from the current analysis to each decision."""
     span = float(action["duration"])
-    bones = list(source["bones"])
-
-    adopted = [d for d in decisions if isinstance(d, dict) and d.get("resolution") == "source"]
-    if not adopted:
-        raise ValueError("没有需要应用的返修区间")
-
-    keyframes = [dict(frame, pose=deepcopy(frame["pose"])) for frame in action["keyframes"]]
-    for decision in adopted:
+    analysis = analyze_rebake(project, action)
+    all_bones = list(action["source"]["bones"])
+    normalized: list[dict[str, Any]] = []
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            raise ValueError("返修决定必须是对象")
+        resolution = decision.get("resolution")
+        if resolution not in ("source", "keep"):
+            raise ValueError("返修决定的 resolution 必须是 source 或 keep")
         window = decision.get("segment") or {}
         start = float(window.get("start", 0.0))
         end = float(window.get("end", 0.0))
         if end < start or start < -1e-9 or end > span + 1e-9:
             raise ValueError(f"返修区间 {start:g}~{end:g}s 无效")
+        match = next(
+            (segment for segment in analysis
+             if abs(segment["start"] - start) < 1e-6 and abs(segment["end"] - end) < 1e-6),
+            None,
+        )
+        normalized.append({
+            "start": max(0.0, start),
+            "end": min(end, span),
+            "resolution": resolution,
+            "bones": list(match["bones"]) if match else list(all_bones),
+            "manual": bool(match["manual"]) if match else False,
+        })
+    return normalized
+
+
+def _compute_rebake(
+    project: dict[str, Any],
+    action: dict[str, Any],
+    normalized: list[dict[str, Any]],
+    revision: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return (new keyframes, adopted frames) for normalized decisions.
+
+    "source" windows are re-baked from the current source project (replacing
+    any manual keyframes inside); "keep" windows stay untouched and their
+    manual keyframes are stamped with the source version they were kept
+    against, so a later source edit still re-flags the conflict.
+    """
+    source = action["source"]
+    fps = float(source.get("fps", 60.0))
+    range_start = float(source["range_start"])
+    span = float(action["duration"])
+    bones = list(source["bones"])
+    source_version = int(project.get("version", 1))
+
+    keyframes = [dict(frame, pose=deepcopy(frame["pose"])) for frame in action["keyframes"]]
+    adopted_frames: list[dict[str, Any]] = []
+    for segment in normalized:
+        start = segment["start"]
+        end = segment["end"]
+        if segment["resolution"] == "keep":
+            if segment["manual"]:
+                for frame in keyframes:
+                    if start - 1e-9 <= float(frame["time"]) <= end + 1e-9 \
+                            and frame.get("origin") == "manual":
+                        frame["kept_source_version"] = source_version
+            continue
         keyframes = [
             frame for frame in keyframes
             if float(frame["time"]) < start - 1e-9 or float(frame["time"]) > end + 1e-9
@@ -756,8 +856,8 @@ def apply_rebake(
         for index in range(first_index, last_index + 1):
             local_time = min(index / fps, span)
             source_pose = sample_local(project, range_start + local_time)
-            keyframes.append({
-                "id": f"{action_id}-r{int(action.get('revision', 1)) + 1}-kf-{index}",
+            frame = {
+                "id": f"{action['id']}-r{revision}-kf-{index}",
                 "time": round(local_time, 9),
                 "pose": {
                     bone_id: {
@@ -768,7 +868,263 @@ def apply_rebake(
                     for bone_id in bones
                 },
                 "origin": "baked",
-            })
+            }
+            keyframes.append(frame)
+            adopted_frames.append(deepcopy(frame))
+    keyframes.sort(key=lambda frame: float(frame["time"]))
+    return keyframes, adopted_frames
+
+
+def apply_rebake(
+    project: dict[str, Any],
+    action_id: str,
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Apply per-segment rebake decisions to one action; returns the new action.
+
+    Each decision is {"segment": {"start", "end"}, "resolution": "source"|"keep"}.
+    Adjacent untouched frames still equal the source pose, so neighbouring
+    segments stay pose-continuous. The previous keyframes are snapshotted and
+    a decision-log entry is recorded so later revisions can declare which
+    confirmed decisions they depend on and unrelated ones can be withdrawn
+    independently.
+    """
+    action = _find_action(project, action_id)
+    if not decisions:
+        raise ValueError("没有需要应用的返修区间")
+    normalized = _normalize_decisions(project, action, decisions)
+    adopted = [segment for segment in normalized if segment["resolution"] == "source"]
+    keeps = [segment for segment in normalized if segment["resolution"] == "keep" and segment["manual"]]
+    if not adopted and not keeps:
+        raise ValueError("没有需要应用的返修区间")
+
+    revision = int(action.get("revision", 1)) + 1
+    keyframes, adopted_frames = _compute_rebake(project, action, normalized, revision)
+
+    updated = deepcopy(action)
+    updated["keyframes"] = keyframes
+    updated["revision"] = revision
+    previous_versions = list(action.get("previous_versions", []))
+    previous_versions.append({
+        "revision": int(action.get("revision", 1)),
+        "keyframes": deepcopy(action["keyframes"]),
+        "saved_at": _utc_now_iso(),
+    })
+    updated["previous_versions"] = previous_versions
+    source = action["source"]
+    updated["source"] = {**source, "updated_at": _utc_now_iso()}
+    decision_log = list(action.get("decision_log", []))
+    decision_log.append({
+        "id": f"{action_id}-d{revision}",
+        "revision": revision,
+        "source_version": int(project.get("version", 1)),
+        "applied_at": _utc_now_iso(),
+        "segments": normalized,
+        "frames": adopted_frames,
+    })
+    updated["decision_log"] = decision_log
+    if not analyze_rebake(project, updated):
+        updated["source"]["source_version"] = int(project.get("version", 1))
+    return updated
+
+
+def create_plan(
+    project: dict[str, Any],
+    action_id: str,
+    name: str,
+    decisions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Store a set of adoption decisions as a comparable, unpublished plan.
+
+    The plan carries a full preview of the resulting keyframes computed
+    against the current source version; the action itself is not modified,
+    so several plans can coexist and stay editable until one is published.
+    """
+    action = _find_action(project, action_id)
+    if not decisions:
+        raise ValueError("方案至少需要一条采用决定")
+    normalized = _normalize_decisions(project, action, decisions)
+    if not any(segment["resolution"] == "source" or segment["manual"] for segment in normalized):
+        raise ValueError("方案不含任何采用或保留决定")
+    revision = int(action.get("revision", 1)) + 1
+    keyframes, _ = _compute_rebake(project, action, normalized, revision)
+    plans = [plan for plan in action.get("plans", []) if isinstance(plan, dict)]
+    plan_id = f"{action_id}-plan-{len(plans) + 1}"
+    plan = {
+        "id": plan_id,
+        "name": str(name).strip() or f"方案 {len(plans) + 1}",
+        "created_at": _utc_now_iso(),
+        "base_revision": int(action.get("revision", 1)),
+        "source_version": int(project.get("version", 1)),
+        "decisions": normalized,
+        "keyframes": keyframes,
+        "published": False,
+    }
+    updated = deepcopy(action)
+    updated["plans"] = plans + [plan]
+    return updated
+
+
+def delete_plan(project: dict[str, Any], action_id: str, plan_id: str) -> dict[str, Any]:
+    action = _find_action(project, action_id)
+    plans = list(action.get("plans", []))
+    remaining = [plan for plan in plans if plan.get("id") != plan_id]
+    if len(remaining) == len(plans):
+        raise ValueError(f"找不到方案 {plan_id}")
+    updated = deepcopy(action)
+    updated["plans"] = remaining
+    return updated
+
+
+def publish_plan(project: dict[str, Any], action_id: str, plan_id: str) -> dict[str, Any]:
+    """Publish one plan as the action's next revision.
+
+    Only this plan's keyframes become the new published revision; other plans
+    stay editable, and every earlier published revision remains playable via
+    previous_versions. The adopted decisions enter the decision log so later
+    revisions can track dependencies and independent withdrawals.
+    """
+    action = _find_action(project, action_id)
+    plan = next((item for item in action.get("plans", []) if item.get("id") == plan_id), None)
+    if plan is None:
+        raise ValueError(f"找不到方案 {plan_id}")
+    if plan.get("published"):
+        raise ValueError(f"方案「{plan.get('name', plan_id)}」已发布过")
+
+    revision = int(action.get("revision", 1)) + 1
+    decisions = [dict(segment) for segment in plan.get("decisions", [])]
+    adopted_windows = [segment for segment in decisions if segment.get("resolution") == "source"]
+    adopted_frames = [
+        deepcopy(frame) for frame in plan.get("keyframes", [])
+        if any(segment["start"] - 1e-9 <= float(frame["time"]) <= segment["end"] + 1e-9
+               for segment in adopted_windows)
+    ]
+
+    updated = deepcopy(action)
+    updated["keyframes"] = deepcopy(plan["keyframes"])
+    updated["revision"] = revision
+    previous_versions = list(action.get("previous_versions", []))
+    previous_versions.append({
+        "revision": int(action.get("revision", 1)),
+        "keyframes": deepcopy(action["keyframes"]),
+        "saved_at": _utc_now_iso(),
+    })
+    updated["previous_versions"] = previous_versions
+    updated["source"] = {**action["source"], "updated_at": _utc_now_iso()}
+    decision_log = list(action.get("decision_log", []))
+    decision_log.append({
+        "id": f"{action_id}-d{revision}",
+        "revision": revision,
+        "source_version": int(plan.get("source_version", project.get("version", 1))),
+        "applied_at": _utc_now_iso(),
+        "segments": decisions,
+        "frames": adopted_frames,
+        "plan_id": plan_id,
+    })
+    updated["decision_log"] = decision_log
+    updated["plans"] = [
+        {**item, "published": True, "published_revision": revision} if item.get("id") == plan_id else item
+        for item in action.get("plans", [])
+    ]
+    if not analyze_rebake(project, updated):
+        updated["source"]["source_version"] = int(project.get("version", 1))
+    return updated
+
+
+def _segments_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    time_overlap = min(float(a["end"]), float(b["end"])) - max(float(a["start"]), float(b["start"]))
+    if time_overlap <= 1e-9:
+        return False
+    return bool(set(a.get("bones", [])) & set(b.get("bones", [])))
+
+
+def _withdraw_closure(log: list[dict[str, Any]], target_id: str) -> tuple[set[str], list[dict[str, Any]]]:
+    """Decisions that must be withdrawn together, plus the independent ones."""
+    target = next((entry for entry in log if entry.get("id") == target_id), None)
+    if target is None:
+        raise ValueError(f"找不到采用决定 {target_id}")
+    withdrawn: set[str] = {target_id}
+    changed = True
+    while changed:
+        changed = False
+        for entry in log:
+            if entry.get("id") in withdrawn:
+                continue
+            if int(entry.get("revision", 0)) <= int(target.get("revision", 0)):
+                continue
+            for other in log:
+                if other.get("id") not in withdrawn:
+                    continue
+                if any(_segments_overlap(seg_a, seg_b)
+                       for seg_a in entry.get("segments", [])
+                       for seg_b in other.get("segments", [])):
+                    withdrawn.add(entry["id"])
+                    changed = True
+                    break
+    independent = [
+        entry for entry in log
+        if entry.get("id") not in withdrawn
+        and int(entry.get("revision", 0)) > int(target.get("revision", 0))
+    ]
+    return withdrawn, independent
+
+
+def analyze_withdraw(project: dict[str, Any], action_id: str, decision_id: str) -> dict[str, Any]:
+    """Preview a withdrawal: what must go with it and what stays independent."""
+    action = _find_action(project, action_id)
+    log = list(action.get("decision_log", []))
+    withdrawn, independent = _withdraw_closure(log, decision_id)
+    target = next(entry for entry in log if entry.get("id") == decision_id)
+    dependents = [entry for entry in log if entry.get("id") in withdrawn and entry.get("id") != decision_id]
+    return {
+        "target": target,
+        "dependents": dependents,
+        "independent": independent,
+        "withdrawn_ids": sorted(withdrawn),
+        "base_revision": int(target.get("revision", 1)) - 1,
+    }
+
+
+def withdraw_decision(project: dict[str, Any], action_id: str, decision_id: str) -> dict[str, Any]:
+    """Withdraw an earlier confirmed decision without erasing unrelated fixes.
+
+    Keyframes are rebuilt from the snapshot taken just before the target
+    decision, then every independent later decision is replayed exactly as it
+    was confirmed (its stored frames and keep-stamps), so later unrelated
+    manual retouch decisions survive untouched.
+    """
+    action = _find_action(project, action_id)
+    log = list(action.get("decision_log", []))
+    withdrawn, _ = _withdraw_closure(log, decision_id)
+    target = next(entry for entry in log if entry.get("id") == decision_id)
+    base_revision = int(target.get("revision", 1)) - 1
+    snapshot = next(
+        (item for item in action.get("previous_versions", []) if int(item.get("revision", 0)) == base_revision),
+        None,
+    )
+    if snapshot is None:
+        raise ValueError(f"缺少修订 r{base_revision} 的快照，无法安全撤回")
+
+    keyframes = [dict(frame, pose=deepcopy(frame["pose"])) for frame in snapshot["keyframes"]]
+    for entry in log:
+        if entry.get("id") in withdrawn:
+            continue
+        if int(entry.get("revision", 0)) <= base_revision:
+            continue
+        for segment in entry.get("segments", []):
+            start = float(segment["start"])
+            end = float(segment["end"])
+            if segment.get("resolution") == "source":
+                keyframes = [
+                    frame for frame in keyframes
+                    if float(frame["time"]) < start - 1e-9 or float(frame["time"]) > end + 1e-9
+                ]
+                keyframes.extend(deepcopy(entry.get("frames", [])))
+            elif segment.get("manual"):
+                for frame in keyframes:
+                    if start - 1e-9 <= float(frame["time"]) <= end + 1e-9 \
+                            and frame.get("origin") == "manual":
+                        frame["kept_source_version"] = int(entry.get("source_version", 1))
     keyframes.sort(key=lambda frame: float(frame["time"]))
 
     updated = deepcopy(action)
@@ -781,10 +1137,149 @@ def apply_rebake(
         "saved_at": _utc_now_iso(),
     })
     updated["previous_versions"] = previous_versions
-    updated["source"] = {**source, "updated_at": _utc_now_iso()}
-    if not analyze_rebake(project, updated):
-        updated["source"]["source_version"] = int(project.get("version", 1))
+    updated["decision_log"] = [entry for entry in log if entry.get("id") not in withdrawn]
+    withdrawals = list(action.get("withdrawals", []))
+    withdrawals.append({
+        "withdrawn_ids": sorted(withdrawn),
+        "revision": updated["revision"],
+        "at": _utc_now_iso(),
+    })
+    updated["withdrawals"] = withdrawals
     return updated
+
+
+def _variant_poses(
+    keyframes: list[dict[str, Any]],
+    fps: float,
+    span: float,
+) -> list[dict[str, dict[str, float]]]:
+    count = int(round(span * fps)) + 1
+    return [sample_frames(keyframes, min(index / fps, span)) for index in range(count)]
+
+
+def compare_action_variants(
+    project: dict[str, Any],
+    action_id: str,
+    plan_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Side-by-side comparison of the layered source, revisions and plans.
+
+    For every sampled frame the report classifies each differing bone as a
+    source-driven change (the variant matches the current source pose) or a
+    manual adoption/keep, and checks pose continuity across the boundaries of
+    every adopted update window (inside vs. one frame outside).
+    """
+    action = _find_action(project, action_id)
+    source = action["source"]
+    fps = float(source.get("fps", 60.0))
+    range_start = float(source["range_start"])
+    span = float(action["duration"])
+    bones = list(source["bones"])
+    count = int(round(span * fps)) + 1
+
+    variants: list[dict[str, Any]] = [{
+        "id": "current",
+        "kind": "current",
+        "label": f"当前 r{int(action.get('revision', 1))}",
+        "keyframes": action["keyframes"],
+        "decisions": [],
+    }]
+    for item in action.get("previous_versions", []):
+        variants.append({
+            "id": f"r{item['revision']}",
+            "kind": "revision",
+            "label": f"历史 r{item['revision']}",
+            "keyframes": item["keyframes"],
+            "decisions": [],
+        })
+    plans = [
+        plan for plan in action.get("plans", [])
+        if plan_ids is None or plan.get("id") in plan_ids
+    ]
+    for plan in plans:
+        variants.append({
+            "id": plan["id"],
+            "kind": "plan",
+            "label": plan.get("name", plan["id"]),
+            "keyframes": plan["keyframes"],
+            "decisions": plan.get("decisions", []),
+            "source_version": plan.get("source_version"),
+        })
+
+    source_poses = [sample_local(project, range_start + min(index / fps, span)) for index in range(count)]
+    for variant in variants:
+        variant["_poses"] = _variant_poses(variant["keyframes"], fps, span)
+
+    def diff_frames(a: dict[str, Any], b: dict[str, Any]) -> list[dict[str, Any]]:
+        frames: list[dict[str, Any]] = []
+        for index in range(count):
+            entries: list[dict[str, Any]] = []
+            for bone_id in bones:
+                pa = a["_poses"][index].get(bone_id)
+                pb = b["_poses"][index].get(bone_id)
+                if pa is None or pb is None or not _transform_differs(pa, pb):
+                    continue
+                source_pose = source_poses[index].get(bone_id)
+                origin = "source" if source_pose is not None and not _transform_differs(pb, source_pose) else "manual"
+                entries.append({"bone": bone_id, "origin": origin})
+            if entries:
+                frames.append({"time": min(index / fps, span), "bones": entries})
+        return frames
+
+    diffs: list[dict[str, Any]] = []
+    current = variants[0]
+    for variant in variants:
+        if variant["id"] == "current":
+            continue
+        diffs.append({"a": "current", "b": variant["id"], "frames": diff_frames(current, variant)})
+    plan_variants = [variant for variant in variants if variant["kind"] == "plan"]
+    if len(plan_variants) == 2:
+        diffs.append({
+            "a": plan_variants[0]["id"],
+            "b": plan_variants[1]["id"],
+            "frames": diff_frames(plan_variants[0], plan_variants[1]),
+        })
+
+    continuity: list[dict[str, Any]] = []
+    for variant in variants:
+        for segment in variant.get("decisions", []):
+            if segment.get("resolution") != "source":
+                continue
+            for boundary, outside_index in (
+                (float(segment["start"]), int(math.ceil(float(segment["start"]) * fps - 1e-9)) - 1),
+                (float(segment["end"]), int(math.floor(float(segment["end"]) * fps + 1e-9)) + 1),
+            ):
+                inside_index = outside_index + 1 if boundary == float(segment["start"]) else outside_index - 1
+                if outside_index < 0 or outside_index >= count or inside_index < 0 or inside_index >= count:
+                    continue
+                for bone_id in segment.get("bones", bones):
+                    inside = variant["_poses"][inside_index].get(bone_id)
+                    outside = variant["_poses"][outside_index].get(bone_id)
+                    if inside is None or outside is None:
+                        continue
+                    delta = abs(shortest_angle_delta(outside["rotation"], inside["rotation"]))
+                    delta = max(delta, abs(inside["x"] - outside["x"]), abs(inside["y"] - outside["y"]))
+                    if delta > 1e-6:
+                        continuity.append({
+                            "variant": variant["id"],
+                            "label": variant["label"],
+                            "boundary": round(boundary, 9),
+                            "bone": bone_id,
+                            "delta": delta,
+                        })
+
+    for variant in variants:
+        variant.pop("_poses", None)
+        variant.pop("keyframes", None)
+    return {
+        "action_id": action_id,
+        "fps": fps,
+        "span": span,
+        "source_version": int(project.get("version", 1)),
+        "variants": variants,
+        "diffs": diffs,
+        "continuity": continuity,
+    }
 
 
 def sample_local(project: dict[str, Any], time: float) -> dict[str, dict[str, float]]:
@@ -862,6 +1357,11 @@ def migrate_project(project: dict[str, Any]) -> dict[str, Any]:
     for layer in project.get("layers", []) or []:
         if isinstance(layer, dict):
             layer.setdefault("weight_keys", [])
+    for action in project.get("actions", []) or []:
+        if isinstance(action, dict):
+            action.setdefault("plans", [])
+            action.setdefault("decision_log", [])
+            action.setdefault("withdrawals", [])
     return project
 
 

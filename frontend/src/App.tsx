@@ -3,25 +3,33 @@ import { Copy, Layers, Pause, Play, Repeat, RotateCcw, Save, Scissors, TriangleA
 import { api } from "./api";
 import {
   analyzeRebake,
+  analyzeSharedRebake,
+  analyzeWithdraw,
   applyRebake,
   addWeightKey,
   addLayerKeyframe,
   bakeAction,
+  compareActionVariants,
+  createPlan,
+  deletePlan,
   duplicateKeyframe,
   exportAction,
   migrateProject,
   moveKeyframe,
   orderedKeyframes,
+  publishPlan,
   removeWeightKey,
   updateWeightKey,
   updateLayer,
   updateLayerPose,
   updatePose,
   validateProject,
+  withdrawDecision,
   layerEnvelope,
   weightKeyMultiplier,
   sampleLocal,
   type Action,
+  type CompareReport,
   type Project,
 } from "./animation";
 import { defaultProject } from "./defaultProject";
@@ -51,6 +59,10 @@ export default function App() {
   const [segmentChoices, setSegmentChoices] = useState<Record<number, "source" | "keep">>({});
   const [segmentSelected, setSegmentSelected] = useState<Record<number, boolean>>({});
   const [previewRevision, setPreviewRevision] = useState<number | null>(null);
+  const [planName, setPlanName] = useState("");
+  const [compareIds, setCompareIds] = useState<string[]>([]);
+  const [compareReport, setCompareReport] = useState<CompareReport | null>(null);
+  const [withdrawPreview, setWithdrawPreview] = useState<{ decisionId: string; text: string } | null>(null);
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -80,6 +92,7 @@ export default function App() {
     () => (activeAction ? analyzeRebake(project, activeAction) : []),
     [project, activeAction],
   );
+  const sharedAffected = useMemo(() => analyzeSharedRebake(project), [project]);
   const previewKeyframes = useMemo(() => {
     if (!activeAction || previewRevision === null) return null;
     if (previewRevision === (activeAction.revision ?? 1)) return activeAction.keyframes;
@@ -261,13 +274,93 @@ export default function App() {
     commit(full, notice);
   };
 
-  const switchAction = (id: string) => {
-    setActiveActionId(id);
-    setActiveLayerId(null);
-    setTime(0);
-    setSegmentChoices({});
-    setSegmentSelected({});
-    setPreviewRevision(null);
+ const switchAction = (id: string) => {
+   setActiveActionId(id);
+   setActiveLayerId(null);
+   setTime(0);
+   setSegmentChoices({});
+   setSegmentSelected({});
+   setPreviewRevision(null);
+    setCompareIds([]);
+    setCompareReport(null);
+    setWithdrawPreview(null);
+ };
+
+  const currentDecisions = () => rebakeSegments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ index }) => segmentSelected[index])
+    .map(({ segment, index }) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: (segment.manual ? (segmentChoices[index] ?? "keep") : "source") as "source" | "keep",
+    }));
+
+  const savePlan = () => {
+    if (!activeAction) return;
+    try {
+      const next = createPlan(project, activeAction.id, planName, currentDecisions());
+      commit(next, "已保存返修方案；可再保存一个进行对比，发布前动作不变。");
+      setPlanName("");
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "保存方案失败" });
+    }
+  };
+
+  const runCompare = () => {
+    if (!activeAction) return;
+    try {
+      setCompareReport(compareActionVariants(project, activeAction.id, compareIds.length ? compareIds : undefined));
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "对比失败" });
+    }
+  };
+
+  const runPublishPlan = (planId: string) => {
+    if (!activeAction) return;
+    try {
+      const next = publishPlan(project, activeAction.id, planId);
+      const published = next.actions?.find((item) => item.id === activeAction.id);
+      commit(next, `方案已发布为 r${published?.revision ?? "?"}；其余方案仍可继续编辑，旧版本保留可回放。`);
+      setCompareReport(null);
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "发布失败" });
+    }
+  };
+
+  const runDeletePlan = (planId: string) => {
+    if (!activeAction) return;
+    try {
+      commit(deletePlan(project, activeAction.id, planId), "已删除方案。");
+      setCompareIds((ids) => ids.filter((id) => id !== planId));
+      setCompareReport(null);
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "删除失败" });
+    }
+  };
+
+  const runWithdrawPreview = (decisionId: string) => {
+    if (!activeAction) return;
+    try {
+      const preview = analyzeWithdraw(project, activeAction.id, decisionId);
+      const dependentText = preview.dependents.length
+        ? `将一并撤回 ${preview.dependents.length} 条相交的较晚决定（${preview.dependents.map((entry) => "r" + entry.revision).join("、")}）`
+        : "无相交的较晚决定";
+      const independentText = preview.independent.length
+        ? `仍可独立保留 ${preview.independent.length} 条较晚返修（${preview.independent.map((entry) => "r" + entry.revision).join("、")}），不会被抹掉`
+        : "没有更晚的返修";
+      setWithdrawPreview({ decisionId, text: `${dependentText}；${independentText}。确认后从 r${preview.base_revision} 快照重建。` });
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "分析失败" });
+    }
+  };
+
+  const runWithdraw = (decisionId: string) => {
+    if (!activeAction) return;
+    try {
+      commit(withdrawDecision(project, activeAction.id, decisionId), "已撤回较早决定；独立的较晚返修已按原样保留。");
+      setWithdrawPreview(null);
+    } catch (error) {
+      setReport({ ok: false, message: error instanceof Error ? error.message : "撤回失败" });
+    }
   };
 
   const runRebake = async () => {
@@ -404,12 +497,20 @@ export default function App() {
             onClick={() => switchAction("__main__")}>
             <Layers size={14} />源分层工程 v{project.version}
           </button>
-          {(project.actions ?? []).map((action) => <button key={action.id}
-            className={activeActionId === action.id ? "chip selected" : "chip"}
-            onClick={() => switchAction(action.id)}>
-            {action.name}（源 v{action.source.source_version} · r{action.revision ?? 1}）
-          </button>)}
+         {(project.actions ?? []).map((action) => <button key={action.id}
+           className={activeActionId === action.id ? "chip selected" : "chip"}
+           onClick={() => switchAction(action.id)}>
+           {action.name}（源 v{action.source.source_version} · r{action.revision ?? 1}）
+         </button>)}
         </div>
+        {sharedAffected.length > 0 && <div className="shared-overview">
+          <p className="hint warn">源工程 v{project.version} 影响了 {sharedAffected.length} 个共享该源的整理动作；请逐个查看受影响时间、骨骼与采用依据后分别决定，不会强制同步：</p>
+          {sharedAffected.map((item) => <div key={item.action_id} className="rebake-row">
+            <label>{item.name}（整理自 v{item.source_version} · 当前 r{item.revision}）：{item.segments.length} 个受影响区间，
+              {item.segments.map((segment) => `${segment.start.toFixed(2)}~${segment.end.toFixed(2)}s(${segment.bones.join("、")}${segment.manual ? "·含人工返修" : ""})`).join("；")}</label>
+            <button onClick={() => switchAction(item.action_id)}>查看并决定</button>
+          </div>)}
+        </div>}
         {activeAction && <>
           <div className="provenance hint">
             <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}（当前源 v{project.version}），
@@ -440,7 +541,8 @@ export default function App() {
                   onChange={(event) => setSegmentSelected((prev) => ({ ...prev, [index]: event.target.checked }))} />
                 {segment.start.toFixed(2)}~{segment.end.toFixed(2)}s · {segment.bones.join("、")}
               </label>
-              {segment.manual && <span className="rebake-choice">
+             {segment.manual && <span className="rebake-choice">
+              {segment.acknowledged && <span className="hint">已确认保留，手工结果依附源 v{project.version}；源再改时会重新提示冲突。</span>}
                 <em>含人工返修关键帧：</em>
                 <label><input type="radio" name={"seg-" + index} checked={(segmentChoices[index] ?? "keep") === "keep"}
                   onChange={() => setSegmentChoices((prev) => ({ ...prev, [index]: "keep" }))} />保留手工结果</label>
@@ -448,7 +550,59 @@ export default function App() {
                   onChange={() => setSegmentChoices((prev) => ({ ...prev, [index]: "source" }))} />重新采用源动作</label>
               </span>}
             </div>)}
-            <button className="primary bake-btn" onClick={runRebake}><Scissors size={15} />应用所选返修区间（保留其余决定）</button>
+           <button className="primary bake-btn" onClick={runRebake}><Scissors size={15} />应用所选返修区间（保留其余决定）</button>
+            <div className="plan-save">
+              <input type="text" value={planName} placeholder="方案名称，如：保留腕部修正"
+                onChange={(event) => setPlanName(event.target.value)} />
+              <button onClick={savePlan} disabled={!Object.values(segmentSelected).some(Boolean)}>保存为可对比方案</button>
+            </div>
+          </div>}
+          {(activeAction.plans ?? []).length > 0 && <div className="rebake-panel">
+            <div className="card-title"><h3>返修方案（{activeAction.plans?.length}）</h3><span>发布只生成该方案的整理版本，其余方案继续可编辑</span></div>
+            {(activeAction.plans ?? []).map((plan) => <div key={plan.id} className="rebake-row">
+              <label>
+                <input type="checkbox" checked={compareIds.includes(plan.id)}
+                  onChange={(event) => setCompareIds((ids) => event.target.checked
+                    ? [...ids.filter((id) => id !== plan.id), plan.id].slice(-2)
+                    : ids.filter((id) => id !== plan.id))} />
+                {plan.name}（基于 r{plan.base_revision} · 源 v{plan.source_version}）
+              </label>
+              {plan.published
+                ? <span className="hint">已发布为 r{plan.published_revision}</span>
+                : <span className="rebake-choice">
+                    <button onClick={() => runPublishPlan(plan.id)}>发布此方案</button>
+                    <button onClick={() => runDeletePlan(plan.id)}>删除</button>
+                  </span>}
+            </div>)}
+            <button className="bake-btn" onClick={runCompare}>对比方案与源/历史版本</button>
+            {compareReport && <div className="compare-report">
+              <p className="hint">对比基准：源分层工程 v{compareReport.source_version}（{compareReport.fps}fps 逐帧采样）；参与：{compareReport.variants.map((variant) => variant.label).join("、")}。</p>
+              {compareReport.diffs.map((diff) => {
+                const sourceCount = diff.frames.reduce((sum, frame) => sum + frame.bones.filter((bone) => bone.origin === "source").length, 0);
+                const manualCount = diff.frames.reduce((sum, frame) => sum + frame.bones.filter((bone) => bone.origin === "manual").length, 0);
+                const labelOf = (id: string) => compareReport.variants.find((variant) => variant.id === id)?.label ?? id;
+                return <p key={diff.a + "-" + diff.b} className="hint">
+                  {labelOf(diff.a)} ↔ {labelOf(diff.b)}：{diff.frames.length} 帧有差异，其中源变化 {sourceCount} 处、人工采用/保留 {manualCount} 处。
+                </p>;
+              })}
+              {compareReport.continuity.length === 0
+                ? <p className="hint">更新区间边界姿态连续（区间内外逐帧核对无跳变）。</p>
+                : compareReport.continuity.map((item, index) => <p key={index} className="hint warn">
+                    {item.label} 在 {item.boundary.toFixed(2)}s 边界的 {item.bone} 存在 {item.delta.toFixed(2)} 的姿态跳变，请核对区间内外连续性。
+                  </p>)}
+            </div>}
+          </div>}
+          {(activeAction.decision_log ?? []).length > 0 && <div className="rebake-panel">
+            <div className="card-title"><h3>已确认采用记录</h3><span>撤回较早决定前会展示仍可独立保留的较晚返修</span></div>
+            {(activeAction.decision_log ?? []).map((entry) => <div key={entry.id} className="rebake-row">
+              <label>r{entry.revision} · 依附源 v{entry.source_version} · {entry.segments.map((segment) => `${segment.start.toFixed(2)}~${segment.end.toFixed(2)}s(${segment.resolution === "source" ? "采用" : "保留"}:${segment.bones.join("、")})`).join("；")}</label>
+              <button onClick={() => runWithdrawPreview(entry.id)}>撤回…</button>
+              {withdrawPreview?.decisionId === entry.id && <span className="rebake-choice">
+                <em>{withdrawPreview.text}</em>
+                <button onClick={() => runWithdraw(entry.id)}>确认撤回</button>
+                <button onClick={() => setWithdrawPreview(null)}>取消</button>
+              </span>}
+            </div>)}
           </div>}
         </>}
         {!activeAction && <div className="bake-panel">

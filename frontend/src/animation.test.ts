@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, evaluateWorld, exportAction, layerEnvelope, migrateProject, removeWeightKey, sampleLocal, shortestAngleDelta, updatePose, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
+import { analyzeSharedRebake, analyzeWithdraw, compareActionVariants, createPlan, deletePlan, publishPlan, withdrawDecision } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -214,7 +215,146 @@ describe("animation core", () => {
       segment: { start: segment.start, end: segment.end }, resolution: "source" as const,
     })));
     expect(analyzeRebake(edited, final.actions![0])).toHaveLength(0);
-    expect(final.actions![0].source.source_version).toBe(2);
-    expect(validateProject(final)).toHaveLength(0);
+   expect(final.actions![0].source.source_version).toBe(2);
+   expect(validateProject(final)).toHaveLength(0);
+ });
+});
+
+describe("shared source rebake plans", () => {
+  const makeProject = () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+   const walk = bakeAction(defaultProject, 0, 1.2, bones, "走路整理").action;
+   const turn = bakeAction(defaultProject, 0, 1.2, bones, "转身整理").action;
+    walk.id = "walk";
+    turn.id = "turn";
+    walk.keyframes[10].pose.spine.rotation = 45;
+    walk.keyframes[10].origin = "manual";
+    turn.keyframes[20].pose.upper_arm_r.rotation = 90;
+    turn.keyframes[20].origin = "manual";
+    const project = structuredClone(defaultProject);
+    project.actions = [walk, turn];
+    project.version = 2;
+    project.keyframes[1].pose.spine.rotation = 9;
+    return project;
+  };
+
+  it("reports each shared-source action independently", () => {
+    const project = makeProject();
+   const overview = analyzeSharedRebake(project);
+    expect(overview.map((item) => item.action_id).sort()).toEqual(["turn", "walk"]);
+    const first = overview[0];
+    const next = applyRebake(project, first.action_id, first.segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: (segment.manual ? "keep" : "source") as "keep" | "source",
+    })));
+    const other = next.actions![1];
+    expect(other.revision ?? 1).toBe(1);
+    expect(analyzeRebake(next, other).length).toBeGreaterThan(0);
+  });
+
+  it("attaches kept manual frames to the source version and reflags later edits", () => {
+    const project = makeProject();
+    const actionId = project.actions![0].id;
+    const manualSegment = analyzeRebake(project, project.actions![0]).find((segment) => segment.manual)!;
+    const next = applyRebake(project, actionId, [{
+      segment: { start: manualSegment.start, end: manualSegment.end },
+      resolution: "keep",
+    }]);
+    const kept = next.actions![0].keyframes.filter((frame) => frame.origin === "manual");
+    expect(kept.every((frame) => frame.kept_source_version === 2)).toBe(true);
+    const acknowledged = analyzeRebake(next, next.actions![0]);
+    expect(acknowledged.filter((s) => s.manual).every((s) => s.acknowledged)).toBe(true);
+    const later = structuredClone(next);
+    later.version = 3;
+    later.keyframes[1].pose.spine.rotation = 12;
+    const reflagged = analyzeRebake(later, later.actions![0]);
+    expect(reflagged.some((s) => s.manual && !s.acknowledged)).toBe(true);
+  });
+
+  it("compares two plans, publishes one and keeps the other editable", () => {
+    const project = makeProject();
+    const actionId = project.actions![0].id;
+    const segments = analyzeRebake(project, project.actions![0]);
+    const planA = createPlan(project, actionId, "保留手工修正", segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: (segment.manual ? "keep" : "source") as "keep" | "source",
+    })));
+    const planB = createPlan(planA, actionId, "完整新上身", segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: "source" as const,
+    })));
+    const action = planB.actions![0];
+    expect(action.plans).toHaveLength(2);
+    expect(action.revision ?? 1).toBe(1);
+    expect(validateProject(planB)).toHaveLength(0);
+
+    const report = compareActionVariants(planB, actionId);
+    expect(report.variants.filter((variant) => variant.kind === "plan")).toHaveLength(2);
+    const planDiff = report.diffs.find((diff) => diff.a !== "current")!;
+    expect(planDiff.frames.length).toBeGreaterThan(0);
+    const diffA = report.diffs.find((diff) => diff.b === action.plans![0].id)!;
+    const origins = new Set(diffA.frames.flatMap((frame) => frame.bones.map((bone) => bone.origin)));
+    expect([...origins]).toEqual(["source"]);
+
+    const published = publishPlan(planB, actionId, action.plans![0].id);
+    const publishedAction = published.actions![0];
+    expect(publishedAction.revision).toBe(2);
+    expect(publishedAction.previous_versions).toHaveLength(1);
+    expect(publishedAction.decision_log).toHaveLength(1);
+    expect(publishedAction.plans![0].published).toBe(true);
+    expect(publishedAction.plans![1].published).toBe(false);
+    expect(() => publishPlan(published, actionId, action.plans![0].id)).toThrow();
+    const cleaned = deletePlan(published, actionId, action.plans![1].id);
+    expect(cleaned.actions![0].plans).toHaveLength(1);
+  });
+
+  it("withdraws an earlier decision while preserving independent later fixes", () => {
+    const project = makeProject();
+    const actionId = project.actions![0].id;
+    const firstSegments = analyzeRebake(project, project.actions![0]).filter((segment) => !segment.manual);
+    const first = applyRebake(project, actionId, firstSegments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: "source" as const,
+    })));
+    const secondBase = structuredClone(first);
+    secondBase.version = 3;
+    secondBase.keyframes[1].pose.head = { x: 5, y: -48, rotation: 30 };
+    const headSegments = analyzeRebake(secondBase, secondBase.actions![0]).filter((segment) => segment.bones.includes("head"));
+    expect(headSegments.length).toBeGreaterThan(0);
+    const second = applyRebake(secondBase, actionId, headSegments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: "source" as const,
+    })));
+    const log = second.actions![0].decision_log!;
+    expect(log).toHaveLength(2);
+    const preview = analyzeWithdraw(second, actionId, log[0].id);
+    expect(preview.dependents).toHaveLength(0);
+    expect(preview.independent.map((entry) => entry.id)).toEqual([log[1].id]);
+    const withdrawn = withdrawDecision(second, actionId, log[0].id);
+    const withdrawnAction = withdrawn.actions![0];
+    expect(withdrawnAction.decision_log!.map((entry) => entry.id)).toEqual([log[1].id]);
+    expect(withdrawnAction.withdrawals).toHaveLength(1);
+    const headPose = sampleLocal(secondBase, 0.6).head;
+    const pose = sampleLocal({ ...withdrawnAction, layers: [] } as never, 0.6);
+    expect(pose.head.rotation).toBeCloseTo(headPose.rotation, 7);
+  });
+
+  it("keeps shared relations, plans and withdrawal scope across migrate round-trip", () => {
+    const project = makeProject();
+    const actionId = project.actions![0].id;
+    const segments = analyzeRebake(project, project.actions![0]);
+    const withPlan = createPlan(project, actionId, "方案甲", segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end },
+      resolution: (segment.manual ? "keep" : "source") as "keep" | "source",
+    })));
+    const published = publishPlan(withPlan, actionId, withPlan.actions![0].plans![0].id);
+    const reloaded = migrateProject(JSON.parse(JSON.stringify(published)));
+    const action = reloaded.actions![0];
+    expect(action.plans![0].published).toBe(true);
+    expect(action.decision_log).toHaveLength(1);
+    expect(action.previous_versions).toHaveLength(1);
+    const preview = analyzeWithdraw(reloaded, actionId, action.decision_log![0].id);
+    expect(preview.withdrawn_ids).toEqual([action.decision_log![0].id]);
+    expect(validateProject(reloaded)).toHaveLength(0);
   });
 });
