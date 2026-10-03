@@ -136,6 +136,11 @@ def validate_clip(
         if not isinstance(pose, dict):
             errors.append(f"{frame_prefix}缺少姿态数据")
             continue
+        origin_source_version = keyframe.get("origin_source_version")
+        if origin_source_version is not None and (
+            not isinstance(origin_source_version, int) or origin_source_version < 1
+        ):
+            errors.append(f"{frame_prefix}的 origin_source_version 必须是正整数")
         for pose_bone_id, transform in pose.items():
             if pose_bone_id not in by_id:
                 errors.append(f"{frame_prefix}包含未知骨骼 {pose_bone_id}")
@@ -381,6 +386,68 @@ def validate_project(project: dict[str, Any]) -> list[str]:
                 errors.append(f"{prefix}缺少整理骨骼范围")
             elif any(not isinstance(item, str) or item not in by_id for item in source["bones"]):
                 errors.append(f"{prefix}的整理骨骼范围包含未知骨骼")
+        decision_log = action.get("decision_log", [])
+        if decision_log is None:
+            decision_log = []
+        if not isinstance(decision_log, list):
+            errors.append(f"{prefix}的采用决定记录必须是数组")
+        else:
+            decision_ids: set[str] = set()
+            for decision_index, entry in enumerate(decision_log):
+                entry_prefix = f"{prefix}第 {decision_index + 1} 条采用决定"
+                if not isinstance(entry, dict):
+                    errors.append(f"{entry_prefix}必须是对象")
+                    continue
+                entry_id = entry.get("id")
+                if not isinstance(entry_id, str) or not entry_id.strip():
+                    errors.append(f"{entry_prefix}缺少有效 id")
+                elif entry_id in decision_ids:
+                    errors.append(f"{entry_prefix}id 重复：{entry_id}")
+                else:
+                    decision_ids.add(entry_id)
+                if entry.get("resolution") not in ("source", "keep"):
+                    errors.append(f"{entry_prefix}的决定必须是 source 或 keep")
+                if entry.get("status", "active") not in ("active", "withdrawn"):
+                    errors.append(f"{entry_prefix}的状态必须是 active 或 withdrawn")
+                entry_version = entry.get("source_version")
+                if not isinstance(entry_version, int) or entry_version < 1:
+                    errors.append(f"{entry_prefix}缺少采用依据的源版本号")
+                segment = entry.get("segment")
+                if not isinstance(segment, dict) or not isinstance(segment.get("start"), (int, float)) \
+                        or not isinstance(segment.get("end"), (int, float)) or segment["end"] < segment["start"]:
+                    errors.append(f"{entry_prefix}的时间区间无效")
+        variants = action.get("variants", [])
+        if variants is None:
+            variants = []
+        if not isinstance(variants, list):
+            errors.append(f"{prefix}的采用方案必须是数组")
+        else:
+            variant_ids: set[str] = set()
+            for variant_index, variant in enumerate(variants):
+                variant_prefix = f"{prefix}第 {variant_index + 1} 个采用方案"
+                if not isinstance(variant, dict):
+                    errors.append(f"{variant_prefix}必须是对象")
+                    continue
+                variant_id = variant.get("id")
+                if not isinstance(variant_id, str) or not variant_id.strip():
+                    errors.append(f"{variant_prefix}缺少有效 id")
+                elif variant_id in variant_ids:
+                    errors.append(f"{variant_prefix}id 重复：{variant_id}")
+                else:
+                    variant_ids.add(variant_id)
+                if not isinstance(variant.get("name"), str) or not variant["name"].strip():
+                    errors.append(f"{variant_prefix}缺少名称")
+                if variant.get("status") not in ("draft", "published"):
+                    errors.append(f"{variant_prefix}的状态必须是 draft 或 published")
+                variant_revision = variant.get("revision", 1)
+                if not isinstance(variant_revision, int) or variant_revision < 1:
+                    errors.append(f"{variant_prefix}的修订号必须是正整数")
+                errors.extend(validate_clip(
+                    {"keyframes": variant.get("keyframes", []), "layers": []},
+                    action_duration,
+                    skeleton,
+                    prefix=f"{variant_prefix}内",
+                ))
         errors.extend(validate_clip(action, action_duration, skeleton, prefix=prefix + "内"))
 
     return errors
@@ -590,6 +657,8 @@ def bake_action(
         "layers": [],
         "revision": 1,
         "previous_versions": [],
+        "decision_log": [],
+        "variants": [],
         "source": {
             "action_id": "__main__",
             "source_version": source_version,
@@ -710,22 +779,70 @@ def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict
             })
     for segment in segments:
         segment.pop("_last_index")
+    active_decisions = [
+        entry for entry in action.get("decision_log", []) or []
+        if isinstance(entry, dict) and entry.get("status", "active") == "active"
+    ]
+    for segment in segments:
+        segment["basis"] = [
+            {
+                "id": entry["id"],
+                "revision": entry.get("revision"),
+                "resolution": entry.get("resolution"),
+                "source_version": entry.get("source_version"),
+                "variant_id": entry.get("variant_id"),
+            }
+            for entry in active_decisions
+            if _segments_intersect(
+                {"start": segment["start"], "end": segment["end"], "bones": segment["bones"]},
+                entry.get("segment") or {},
+            )
+        ]
     return segments
+
+
+def _segments_intersect(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Two decision/analysis segments intersect when time windows and bones overlap."""
+    try:
+        first_start = float(first.get("start", 0.0))
+        first_end = float(first.get("end", 0.0))
+        second_start = float(second.get("start", 0.0))
+        second_end = float(second.get("end", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if first_start > second_end + 1e-9 or second_start > first_end + 1e-9:
+        return False
+    first_bones = set(first.get("bones") or [])
+    second_bones = set(second.get("bones") or [])
+    return bool(first_bones & second_bones)
+
+
+def _next_decision_id(action: dict[str, Any]) -> str:
+    return f"{action['id']}-d{len(action.get('decision_log', []) or []) + 1}"
 
 
 def apply_rebake(
     project: dict[str, Any],
     action_id: str,
     decisions: list[dict[str, Any]],
+    variant_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply per-segment rebake decisions to one action; returns the new action.
 
     Each decision is {"segment": {"start", "end"}, "resolution": "source"|"keep"}.
     "source" re-bakes that window from the current source project (replacing any
-    manual keyframes inside it); "keep" leaves the window untouched. Adjacent
+    manual keyframes inside it); "keep" leaves the window untouched and stamps
+    the kept manual keyframes with the source version they were confirmed
+    against, so later source edits can still detect the conflict. Adjacent
     untouched frames still equal the source pose, so neighbouring segments stay
-    pose-continuous. The previous keyframes are snapshotted so older revisions
-    remain playable after save/reload.
+    pose-continuous. Every confirmed decision is appended to the action's
+    decision_log with the source version it is based on.
+
+    With variant_id the decisions are applied to that draft variant's keyframes
+    instead of the action itself, so two adoption plans for the same source
+    revision stay independently editable until one is published. Without
+    variant_id the previous keyframes are snapshotted so older revisions remain
+    playable after save/reload.
     """
     action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
     if action is None:
@@ -736,11 +853,30 @@ def apply_rebake(
     span = float(action["duration"])
     bones = list(source["bones"])
 
-    adopted = [d for d in decisions if isinstance(d, dict) and d.get("resolution") == "source"]
-    if not adopted:
+    confirmed = [
+        d for d in decisions
+        if isinstance(d, dict) and d.get("resolution") in ("source", "keep")
+    ]
+    if not confirmed:
         raise ValueError("没有需要应用的返修区间")
+    adopted = [d for d in confirmed if d.get("resolution") == "source"]
+    keeps = [d for d in confirmed if d.get("resolution") == "keep"]
 
-    keyframes = [dict(frame, pose=deepcopy(frame["pose"])) for frame in action["keyframes"]]
+    variant: dict[str, Any] | None = None
+    if variant_id is not None:
+        variant = next(
+            (item for item in action.get("variants", []) or [] if item.get("id") == variant_id),
+            None,
+        )
+        if variant is None:
+            raise ValueError(f"找不到方案 {variant_id}")
+        if variant.get("status") != "draft":
+            raise ValueError(f"方案「{variant.get('name', variant_id)}」已发布，不能再编辑")
+
+    base_frames = variant["keyframes"] if variant is not None else action["keyframes"]
+    keyframes = [dict(frame, pose=deepcopy(frame["pose"])) for frame in base_frames]
+    target_revision = int((variant if variant is not None else action).get("revision", 1)) + 1
+    source_version = int(project.get("version", 1))
     for decision in adopted:
         window = decision.get("segment") or {}
         start = float(window.get("start", 0.0))
@@ -757,7 +893,7 @@ def apply_rebake(
             local_time = min(index / fps, span)
             source_pose = sample_local(project, range_start + local_time)
             keyframes.append({
-                "id": f"{action_id}-r{int(action.get('revision', 1)) + 1}-kf-{index}",
+                "id": f"{action_id}-r{target_revision}-kf-{index}",
                 "time": round(local_time, 9),
                 "pose": {
                     bone_id: {
@@ -769,6 +905,198 @@ def apply_rebake(
                 },
                 "origin": "baked",
             })
+    for decision in keeps:
+        window = decision.get("segment") or {}
+        start = float(window.get("start", 0.0))
+        end = float(window.get("end", 0.0))
+        if end < start or start < -1e-9 or end > span + 1e-9:
+            raise ValueError(f"保留区间 {start:g}~{end:g}s 无效")
+        for frame in keyframes:
+            if start - 1e-9 <= float(frame["time"]) <= end + 1e-9 \
+                    and frame.get("origin") == "manual":
+                # The kept manual result is explicitly attached to the source
+                # version it was confirmed against.
+                frame["origin_source_version"] = source_version
+    keyframes.sort(key=lambda frame: float(frame["time"]))
+
+    decision_log = list(action.get("decision_log", []) or [])
+    segment_bones = {
+        id(decision): list((decision.get("segment") or {}).get("bones") or bones)
+        for decision in confirmed
+    }
+    for decision in confirmed:
+        window = decision.get("segment") or {}
+        decision_log.append({
+            "id": _next_decision_id({**action, "decision_log": decision_log}),
+            "revision": target_revision,
+            "variant_id": variant_id,
+            "segment": {
+                "start": float(window.get("start", 0.0)),
+                "end": float(window.get("end", 0.0)),
+                "bones": segment_bones[id(decision)],
+            },
+            "resolution": decision["resolution"],
+            "source_version": source_version,
+            "status": "active",
+            "created_at": _utc_now_iso(),
+        })
+
+    updated = deepcopy(action)
+    updated["decision_log"] = decision_log
+    if variant is not None:
+        updated_variants = []
+        for item in updated.get("variants", []):
+            if item.get("id") == variant_id:
+                item = {**item, "keyframes": keyframes, "revision": target_revision}
+            updated_variants.append(item)
+        updated["variants"] = updated_variants
+    else:
+        updated["keyframes"] = keyframes
+        updated["revision"] = target_revision
+        previous_versions = list(action.get("previous_versions", []))
+        previous_versions.append({
+            "revision": int(action.get("revision", 1)),
+            "keyframes": deepcopy(action["keyframes"]),
+            "saved_at": _utc_now_iso(),
+        })
+        updated["previous_versions"] = previous_versions
+        updated["source"] = {**source, "updated_at": _utc_now_iso()}
+        if not analyze_rebake(project, updated):
+            updated["source"]["source_version"] = source_version
+    return updated
+
+
+def create_variant(
+    project: dict[str, Any],
+    action_id: str,
+    name: str = "",
+    variant_id: str | None = None,
+) -> dict[str, Any]:
+    """Fork the action's current keyframes into a new editable adoption variant."""
+    action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
+    if action is None:
+        raise ValueError(f"找不到整理动作 {action_id}")
+    variants = list(action.get("variants", []) or [])
+    new_id = variant_id or f"{action_id}-var-{len(variants) + 1}"
+    if any(item.get("id") == new_id for item in variants):
+        raise ValueError(f"方案 id 重复：{new_id}")
+    variants.append({
+        "id": new_id,
+        "name": name or f"方案 {len(variants) + 1}",
+        "status": "draft",
+        "keyframes": deepcopy(action["keyframes"]),
+        "revision": 1,
+        "created_at": _utc_now_iso(),
+    })
+    updated = deepcopy(action)
+    updated["variants"] = variants
+    return updated
+
+
+def publish_variant(project: dict[str, Any], action_id: str, variant_id: str) -> dict[str, Any]:
+    """Publish one adoption variant as the action's new revision.
+
+    Only this variant's result becomes the action; other variants stay draft
+    and editable, and the previously published action remains playable via
+    previous_versions.
+    """
+    action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
+    if action is None:
+        raise ValueError(f"找不到整理动作 {action_id}")
+    variant = next(
+        (item for item in action.get("variants", []) or [] if item.get("id") == variant_id),
+        None,
+    )
+    if variant is None:
+        raise ValueError(f"找不到方案 {variant_id}")
+    if variant.get("status") != "draft":
+        raise ValueError(f"方案「{variant.get('name', variant_id)}」已发布过")
+    updated = deepcopy(action)
+    updated["keyframes"] = deepcopy(variant["keyframes"])
+    updated["revision"] = int(action.get("revision", 1)) + 1
+    previous_versions = list(action.get("previous_versions", []))
+    previous_versions.append({
+        "revision": int(action.get("revision", 1)),
+        "keyframes": deepcopy(action["keyframes"]),
+        "saved_at": _utc_now_iso(),
+    })
+    updated["previous_versions"] = previous_versions
+    updated["variants"] = [
+        {**item, "status": "published", "published_at": _utc_now_iso()}
+        if item.get("id") == variant_id else item
+        for item in updated.get("variants", [])
+    ]
+    updated["source"] = {**updated["source"], "updated_at": _utc_now_iso()}
+    if not analyze_rebake(project, updated):
+        updated["source"]["source_version"] = int(project.get("version", 1))
+    return updated
+
+
+def withdrawal_preview(project: dict[str, Any], action_id: str, decision_id: str) -> dict[str, Any]:
+    """Explain what withdrawing one confirmed decision would affect.
+
+    Later decisions whose time/bone window intersects the withdrawn one depend
+    on it; later decisions that do not intersect stay independently keepable
+    and are never erased by the withdrawal.
+    """
+    action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
+    if action is None:
+        raise ValueError(f"找不到整理动作 {action_id}")
+    log = [entry for entry in action.get("decision_log", []) or [] if isinstance(entry, dict)]
+    index = next((i for i, entry in enumerate(log) if entry.get("id") == decision_id), None)
+    if index is None:
+        raise ValueError(f"找不到采用决定 {decision_id}")
+    decision = log[index]
+    if decision.get("status", "active") != "active":
+        raise ValueError(f"决定 {decision_id} 已被撤回")
+    later = [entry for entry in log[index + 1:] if entry.get("status", "active") == "active"]
+    dependents = [entry for entry in later if _segments_intersect(decision.get("segment") or {}, entry.get("segment") or {})]
+    independent = [entry for entry in later if entry not in dependents]
+    return {"decision": decision, "dependents": dependents, "independent": independent}
+
+
+def withdraw_decision(
+    project: dict[str, Any],
+    action_id: str,
+    decision_id: str,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Withdraw one earlier action-level decision, restoring its window only.
+
+    The window is restored from the snapshot taken just before that decision;
+    later unrelated rework outside the window is left untouched. When later
+    dependent decisions overlap the window, confirm=True is required because
+    their effect inside the window is replaced as well.
+    """
+    action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
+    if action is None:
+        raise ValueError(f"找不到整理动作 {action_id}")
+    preview = withdrawal_preview(project, action_id, decision_id)
+    decision = preview["decision"]
+    if decision.get("variant_id"):
+        raise ValueError("方案内的决定请通过继续编辑该方案处理，不能单独撤回")
+    if preview["dependents"] and not confirm:
+        names = "、".join(entry["id"] for entry in preview["dependents"])
+        raise ValueError(f"该决定被后续决定依赖（{names}），确认后才会撤回")
+    window = decision.get("segment") or {}
+    start = float(window.get("start", 0.0))
+    end = float(window.get("end", 0.0))
+    snapshot = next(
+        (item for item in action.get("previous_versions", [])
+         if item.get("revision") == int(decision.get("revision", 1)) - 1),
+        None,
+    )
+    if snapshot is None:
+        raise ValueError("缺少该决定应用前的版本快照，无法安全撤回")
+    restored = [
+        deepcopy(frame) for frame in snapshot["keyframes"]
+        if start - 1e-9 <= float(frame["time"]) <= end + 1e-9
+    ]
+    keyframes = [
+        dict(frame, pose=deepcopy(frame["pose"])) for frame in action["keyframes"]
+        if float(frame["time"]) < start - 1e-9 or float(frame["time"]) > end + 1e-9
+    ]
+    keyframes.extend(restored)
     keyframes.sort(key=lambda frame: float(frame["time"]))
 
     updated = deepcopy(action)
@@ -781,9 +1109,11 @@ def apply_rebake(
         "saved_at": _utc_now_iso(),
     })
     updated["previous_versions"] = previous_versions
-    updated["source"] = {**source, "updated_at": _utc_now_iso()}
-    if not analyze_rebake(project, updated):
-        updated["source"]["source_version"] = int(project.get("version", 1))
+    updated["decision_log"] = [
+        {**entry, "status": "withdrawn"} if entry.get("id") == decision_id else entry
+        for entry in updated.get("decision_log", [])
+    ]
+    updated["source"] = {**updated["source"], "updated_at": _utc_now_iso()}
     return updated
 
 
@@ -862,6 +1192,10 @@ def migrate_project(project: dict[str, Any]) -> dict[str, Any]:
     for layer in project.get("layers", []) or []:
         if isinstance(layer, dict):
             layer.setdefault("weight_keys", [])
+    for action in project.get("actions", []) or []:
+        if isinstance(action, dict):
+            action.setdefault("decision_log", [])
+            action.setdefault("variants", [])
     return project
 
 

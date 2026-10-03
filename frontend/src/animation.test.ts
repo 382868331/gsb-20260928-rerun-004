@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, evaluateWorld, exportAction, layerEnvelope, migrateProject, removeWeightKey, sampleLocal, shortestAngleDelta, updatePose, updateWeightKey, validateProject, weightKeyMultiplier } from "./animation";
+import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, continuityReport, createVariant, evaluateWorld, exportAction, layerEnvelope, migrateProject, publishVariant, removeWeightKey, sampleFrames, sampleLocal, shortestAngleDelta, updatePose, updateWeightKey, validateProject, weightKeyMultiplier, withdrawDecision, withdrawalPreview } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -216,5 +216,175 @@ describe("animation core", () => {
     expect(analyzeRebake(edited, final.actions![0])).toHaveLength(0);
     expect(final.actions![0].source.source_version).toBe(2);
     expect(validateProject(final)).toHaveLength(0);
+  });
+
+  it("keeps shared-source actions independent and tracks adoption basis", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const walk = { ...bakeAction(defaultProject, 0, 1.2, bones, "走路").action, id: "walk" };
+    const turn = { ...bakeAction(defaultProject, 0, 1.2, bones, "转身").action, id: "turn" };
+    const project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [walk, turn] };
+    project.version = 2;
+    project.layers![0].keyframes[0].pose.upper_arm_r.rotation = 300;
+    const segments = analyzeRebake(project, walk);
+    expect(segments.length).toBeGreaterThan(0);
+    const next = applyRebake(project, walk.id, segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })));
+    expect(analyzeRebake(next, next.actions![0])).toHaveLength(0);
+    // the sibling action sharing the same source is untouched and still pending
+    expect(next.actions![1].revision).toBe(1);
+    expect(analyzeRebake(next, next.actions![1]).length).toBeGreaterThan(0);
+    // a later revision intersecting the decided window reports the basis
+    const later = structuredClone(next);
+    later.version = 3;
+    later.layers![0].keyframes[0].pose.upper_arm_r.rotation = 310;
+    const pending = analyzeRebake(later, later.actions![0]);
+    expect(pending.flatMap((segment) => segment.basis.map((entry) => entry.id)))
+      .toContain(next.actions![0].decision_log![0].id);
+    expect(validateProject(later)).toHaveLength(0);
+  });
+
+  it("keeps two adoption variants comparable and independently publishable", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(defaultProject, 0, 1.2, bones, "片段");
+    const actionView = { ...defaultProject, duration: action.duration, keyframes: action.keyframes, layers: [] };
+    const retouched = updatePose(actionView as never, action.keyframes[10].id, "spine", { rotation: 45 });
+    let project: typeof defaultProject = {
+      ...structuredClone(defaultProject),
+      actions: [{ ...action, keyframes: retouched.keyframes }],
+    };
+    project.version = 2;
+    project.keyframes[1].pose.spine.rotation = 9;
+    project = createVariant(project, action.id, "保留手腕");
+    project = createVariant(project, action.id, "完整新上身");
+    const [keepVariant, fullVariant] = project.actions![0].variants!;
+    const segments = analyzeRebake(project, project.actions![0]);
+    // variant A: keep the manual wrist fix, adopt the rest
+    project = applyRebake(project, action.id, segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: (segment.manual ? "keep" : "source") as "keep" | "source",
+    })), keepVariant.id);
+    // variant B: adopt the full new source
+    project = applyRebake(project, action.id, segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })), fullVariant.id);
+    const current = project.actions![0];
+    expect(current.revision).toBe(1);
+    expect(current.variants![0].revision).toBe(2);
+    expect(current.variants![1].revision).toBe(2);
+    const kept = current.variants![0].keyframes.filter((frame) => frame.origin === "manual");
+    expect(kept).toHaveLength(1);
+    expect(kept[0].origin_source_version).toBe(2);
+    expect(current.variants![1].keyframes.filter((frame) => frame.origin === "manual")).toHaveLength(0);
+    expect(current.decision_log!.every((entry) => entry.source_version === 2)).toBe(true);
+    // publishing A only forms A's revision; B stays a draft and editable
+    project = publishVariant(project, action.id, keepVariant.id);
+    const published = project.actions![0];
+    expect(published.revision).toBe(2);
+    expect(published.variants![0].status).toBe("published");
+    expect(published.variants![1].status).toBe("draft");
+    expect(published.previous_versions).toHaveLength(1);
+    expect(() => applyRebake(project, action.id, segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end }, resolution: "source" as const,
+    })), keepVariant.id)).toThrow("已发布");
+    const again = applyRebake(project, action.id, segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end }, resolution: "source" as const,
+    })), fullVariant.id);
+    expect(again.actions![0].variants![1].revision).toBe(3);
+    expect(validateProject(again)).toHaveLength(0);
+  });
+
+  it("withdraws an earlier decision without erasing later independent rework", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(defaultProject, 0, 1.2, bones, "片段");
+    let project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [action] };
+    project.version = 2;
+    project.layers![0].keyframes[0].pose.upper_arm_r.rotation = 300;
+    const first = analyzeRebake(project, action);
+    project = applyRebake(project, action.id, first.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })));
+    project.version = 3;
+    project.layers![0].keyframes[2].pose.upper_arm_r.rotation = 20;
+    const second = analyzeRebake(project, project.actions![0]);
+    expect(second[0].start).toBeGreaterThan(first[0].end);
+    project = applyRebake(project, action.id, second.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })));
+    const log = project.actions![0].decision_log!;
+    expect(log).toHaveLength(2);
+    const preview = withdrawalPreview(project, action.id, log[0].id);
+    expect(preview.dependents).toHaveLength(0);
+    expect(preview.independent.map((entry) => entry.id)).toEqual([log[1].id]);
+    project = withdrawDecision(project, action.id, log[0].id, true);
+    const withdrawn = project.actions![0];
+    expect(withdrawn.decision_log![0].status).toBe("withdrawn");
+    expect(withdrawn.decision_log![1].status).toBe("active");
+    // later unrelated rework still matches the source; the withdrawn window does not
+    withdrawn.keyframes.forEach((frame) => {
+      const sourcePose = sampleLocal(project, frame.time);
+      if (frame.time >= second[0].start - 1e-9 && frame.time <= second[0].end + 1e-9) {
+        expect(frame.pose.upper_arm_r.rotation).toBeCloseTo(sourcePose.upper_arm_r.rotation, 6);
+      }
+    });
+    expect(validateProject(project)).toHaveLength(0);
+  });
+
+  it("requires confirmation when later decisions depend on the withdrawn one", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(defaultProject, 0, 1.2, bones, "片段");
+    let project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [action] };
+    project.version = 2;
+    project.layers![0].keyframes[0].pose.upper_arm_r.rotation = 300;
+    const first = analyzeRebake(project, action);
+    project = applyRebake(project, action.id, first.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })));
+    project.version = 3;
+    project.layers![0].keyframes[0].pose.upper_arm_r.rotation = 320;
+    const overlapping = analyzeRebake(project, project.actions![0]);
+    project = applyRebake(project, action.id, overlapping.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })));
+    const log = project.actions![0].decision_log!;
+    const preview = withdrawalPreview(project, action.id, log[0].id);
+    expect(preview.dependents.map((entry) => entry.id)).toEqual([log[1].id]);
+    expect(() => withdrawDecision(project, action.id, log[0].id)).toThrow("依赖");
+    project = withdrawDecision(project, action.id, log[0].id, true);
+    expect(project.actions![0].decision_log![0].status).toBe("withdrawn");
+  });
+
+  it("checks pose continuity inside and across update window boundaries", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const { action } = bakeAction(defaultProject, 0, 1.2, bones, "片段");
+    let project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [action] };
+    project.version = 2;
+    project.layers![0].keyframes[1].pose.upper_arm_r.rotation = 40;
+    const segments = analyzeRebake(project, action);
+    project = applyRebake(project, action.id, segments.map((segment) => ({
+      segment: { start: segment.start, end: segment.end, bones: segment.bones },
+      resolution: "source" as const,
+    })));
+    const updated = project.actions![0];
+    const windows = updated.decision_log!.map((entry) => ({ start: entry.segment.start, end: entry.segment.end }));
+    const report = continuityReport(updated.keyframes, updated.duration, windows, 60, bones);
+    // adopted windows are re-baked from the same source as their neighbours, so
+    // boundary steps stay in the same range as steps inside and outside
+    expect(report.boundaries.length).toBeGreaterThan(0);
+    expect(report.maxBoundaryDelta).toBeLessThanOrEqual(
+      Math.max(report.maxInsideDelta, report.maxOutsideDelta) + 1e-6,
+    );
+    // every baked frame still matches the source exactly at sample times
+    updated.keyframes.forEach((frame) => {
+      const sourcePose = sampleLocal(project, frame.time);
+      expect(Math.abs(shortestAngleDelta(frame.pose.upper_arm_r.rotation, sourcePose.upper_arm_r.rotation))).toBeLessThan(1e-6);
+    });
+    expect(sampleFrames(updated.keyframes, 0.6).upper_arm_r).toBeDefined();
   });
 });

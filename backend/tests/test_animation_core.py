@@ -8,16 +8,20 @@ from animation_core import (
     analyze_rebake,
     apply_rebake,
     bake_action,
+    create_variant,
     default_project,
     evaluate_world,
     export_action,
     layer_envelope,
     load_project,
     migrate_project,
+    publish_variant,
     sample_local,
     weight_key_multiplier,
     shortest_angle_delta,
     validate_project,
+    withdraw_decision,
+    withdrawal_preview,
 )
 
 
@@ -274,6 +278,179 @@ class AnimationCoreTests(unittest.TestCase):
         self.assertEqual(len(final["previous_versions"]), 2)
         round_trip = json.loads(json.dumps({**project, "actions": [final]}))
         self.assertEqual(validate_project(round_trip), [])
+
+    def _project_with_shared_source_actions(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        walk = bake_action(project, 0.0, 1.2, bone_ids, "走路上身", action_id="walk")
+        turn = bake_action(project, 0.0, 1.2, bone_ids, "转身上身", action_id="turn")
+        project["actions"] = [walk, turn]
+        return project, bone_ids
+
+    def test_shared_source_actions_are_not_force_synchronised(self):
+        project, _ = self._project_with_shared_source_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        walk, turn = project["actions"]
+        walk_segments = analyze_rebake(project, walk)
+        turn_segments = analyze_rebake(project, turn)
+        self.assertTrue(walk_segments and turn_segments)
+        decisions = [
+            {"segment": {"start": s["start"], "end": s["end"], "bones": s["bones"]}, "resolution": "source"}
+            for s in walk_segments
+        ]
+        updated_walk = apply_rebake(project, "walk", decisions)
+        self.assertEqual(analyze_rebake(project, updated_walk), [])
+        # the sibling action sharing the same source is untouched and still pending
+        self.assertEqual(turn["revision"], 1)
+        self.assertEqual(analyze_rebake(project, turn), turn_segments)
+
+    def test_variants_keep_manual_with_source_version_and_publish_independently(self):
+        project, _ = self._project_with_shared_source_actions()
+        project["actions"][0]["keyframes"][10]["pose"]["spine"]["rotation"] = 45.0
+        project["actions"][0]["keyframes"][10]["origin"] = "manual"
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+
+        action = create_variant(project, "walk", "保留手腕")
+        project["actions"][0] = action
+        variant_id = action["variants"][0]["id"]
+        action = create_variant(project, "walk", "完整新上身")
+        project["actions"][0] = action
+        other_id = action["variants"][1]["id"]
+
+        segments = analyze_rebake(project, action)
+        decisions = [
+            {
+                "segment": {"start": s["start"], "end": s["end"], "bones": s["bones"]},
+                "resolution": "keep" if s["manual"] else "source",
+            }
+            for s in segments
+        ]
+        updated = apply_rebake(project, "walk", decisions, variant_id)
+        # the variant evolved; the action itself and the second variant did not
+        self.assertEqual(updated["revision"], 1)
+        self.assertEqual(updated["variants"][0]["revision"], 2)
+        self.assertEqual(updated["variants"][1]["revision"], 1)
+        kept = [f for f in updated["variants"][0]["keyframes"] if f.get("origin") == "manual"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["origin_source_version"], 2)
+        log = updated["decision_log"]
+        self.assertTrue(all(entry["variant_id"] == variant_id for entry in log))
+        self.assertTrue(all(entry["source_version"] == 2 for entry in log))
+        self.assertTrue(any(entry["resolution"] == "keep" for entry in log))
+
+        # second variant adopts the full new source instead
+        project["actions"][0] = updated
+        adopt_all = [
+            {"segment": {"start": s["start"], "end": s["end"], "bones": s["bones"]}, "resolution": "source"}
+            for s in segments
+        ]
+        updated = apply_rebake(project, "walk", adopt_all, other_id)
+        self.assertEqual(
+            [f for f in updated["variants"][1]["keyframes"] if f.get("origin") == "manual"],
+            [],
+        )
+
+        published = publish_variant({**project, "actions": [updated]}, "walk", variant_id)
+        self.assertEqual(published["revision"], 2)
+        self.assertEqual(published["keyframes"], published["variants"][0]["keyframes"])
+        self.assertEqual(published["variants"][0]["status"], "published")
+        self.assertEqual(published["variants"][1]["status"], "draft")
+        self.assertEqual(len(published["previous_versions"]), 1)
+        # publishing one variant must not lock the other
+        again = apply_rebake({**project, "actions": [published]}, "walk", adopt_all, other_id)
+        self.assertEqual(again["variants"][1]["revision"], 3)
+        with self.assertRaises(ValueError):
+            apply_rebake({**project, "actions": [published]}, "walk", adopt_all, variant_id)
+        round_trip = json.loads(json.dumps({**project, "actions": [again]}))
+        self.assertEqual(validate_project(round_trip), [])
+
+    def test_decision_basis_and_withdrawal_preserve_later_independent_rework(self):
+        project, _ = self._project_with_shared_source_actions()
+        project["version"] = 2
+        # edit the wave layer's first keyframe: affects only the early window
+        project["layers"][0]["keyframes"][0]["pose"]["upper_arm_r"]["rotation"] = 300.0
+        first_segments = analyze_rebake(project, project["actions"][0])
+        self.assertEqual(len(first_segments), 1)
+        first = first_segments[0]
+        apply = lambda proj, segs: apply_rebake(proj, "walk", [
+            {"segment": {"start": s["start"], "end": s["end"], "bones": s["bones"]}, "resolution": "source"}
+            for s in segs
+        ])
+        step1 = apply(project, first_segments)
+        # a second, later source revision affects a disjoint later window
+        project["version"] = 3
+        project["layers"][0]["keyframes"][2]["pose"]["upper_arm_r"]["rotation"] = 20.0
+        last_segments = analyze_rebake(project, step1)
+        self.assertEqual(len(last_segments), 1)
+        last = last_segments[0]
+        self.assertLess(first["end"], last["start"])
+        step2 = apply({**project, "actions": [step1]}, last_segments)
+        project["actions"][0] = step2
+        log = step2["decision_log"]
+        self.assertEqual(len(log), 2)
+
+        # a later source revision intersecting the first window reports its basis
+        project["version"] = 4
+        project["layers"][0]["keyframes"][0]["pose"]["upper_arm_r"]["rotation"] = 310.0
+        pending = analyze_rebake(project, project["actions"][0])
+        basis_ids = [entry["id"] for segment in pending for entry in segment["basis"]]
+        self.assertIn(log[0]["id"], basis_ids)
+
+        preview = withdrawal_preview(project, "walk", log[0]["id"])
+        self.assertEqual([entry["id"] for entry in preview["independent"]], [log[1]["id"]])
+        self.assertEqual(preview["dependents"], [])
+
+        withdrawn = withdraw_decision(project, "walk", log[0]["id"])
+        statuses = {entry["id"]: entry["status"] for entry in withdrawn["decision_log"]}
+        self.assertEqual(statuses[log[0]["id"]], "withdrawn")
+        self.assertEqual(statuses[log[1]["id"]], "active")
+        # the first window is back to the pre-decision (v1) poses...
+        for frame in withdrawn["keyframes"]:
+            if first["start"] - 1e-9 <= frame["time"] <= first["end"] + 1e-9:
+                original = next(
+                    item for item in project["actions"][0]["previous_versions"][0]["keyframes"]
+                    if abs(item["time"] - frame["time"]) < 1e-9
+                )
+                self.assertAlmostEqual(frame["pose"]["spine"]["rotation"], original["pose"]["spine"]["rotation"])
+        # ...while the later unrelated rework in the second window is untouched
+        for frame in withdrawn["keyframes"]:
+            if last["start"] - 1e-9 <= frame["time"] <= last["end"] + 1e-9:
+                source_pose = sample_local(project, frame["time"])
+                self.assertAlmostEqual(
+                    frame["pose"]["upper_arm_r"]["rotation"],
+                    source_pose["upper_arm_r"]["rotation"],
+                )
+        round_trip = json.loads(json.dumps({**project, "actions": [withdrawn]}))
+        self.assertEqual(validate_project(round_trip), [])
+
+    def test_withdrawal_requires_confirmation_when_later_decisions_depend(self):
+        project, _ = self._project_with_shared_source_actions()
+        project["version"] = 2
+        project["layers"][0]["keyframes"][0]["pose"]["upper_arm_r"]["rotation"] = 300.0
+        segments = analyze_rebake(project, project["actions"][0])
+        first = segments[0]
+        apply = lambda proj, segs: apply_rebake(proj, "walk", [
+            {"segment": {"start": s["start"], "end": s["end"], "bones": s["bones"]}, "resolution": "source"}
+            for s in segs
+        ])
+        step1 = apply(project, [first])
+        project["actions"][0] = step1
+        project["version"] = 3
+        project["layers"][0]["keyframes"][0]["pose"]["upper_arm_r"]["rotation"] = 320.0
+        overlapping = [s for s in analyze_rebake(project, step1)
+                       if s["start"] <= first["end"] + 1e-9]
+        self.assertTrue(overlapping)
+        step2 = apply(project, overlapping[:1])
+        project["actions"][0] = step2
+        log = step2["decision_log"]
+        preview = withdrawal_preview(project, "walk", log[0]["id"])
+        self.assertEqual([entry["id"] for entry in preview["dependents"]], [log[1]["id"]])
+        with self.assertRaises(ValueError):
+            withdraw_decision(project, "walk", log[0]["id"])
+        withdrawn = withdraw_decision(project, "walk", log[0]["id"], confirm=True)
+        self.assertEqual(withdrawn["decision_log"][0]["status"], "withdrawn")
 
 
 if __name__ == "__main__":

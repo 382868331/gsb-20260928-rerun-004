@@ -7,12 +7,16 @@ import {
   addWeightKey,
   addLayerKeyframe,
   bakeAction,
+  continuityReport,
+  createVariant,
   duplicateKeyframe,
   exportAction,
   migrateProject,
   moveKeyframe,
   orderedKeyframes,
+  publishVariant,
   removeWeightKey,
+  sampleFrames,
   updateWeightKey,
   updateLayer,
   updateLayerPose,
@@ -21,8 +25,14 @@ import {
   layerEnvelope,
   weightKeyMultiplier,
   sampleLocal,
+  shortestAngleDelta,
+  withdrawDecision,
+  withdrawalPreview,
   type Action,
+  type ActionVariant,
   type Project,
+  type Transform,
+  type WithdrawalPreview,
 } from "./animation";
 import { defaultProject } from "./defaultProject";
 import { SkeletonCanvas } from "./SkeletonCanvas";
@@ -31,6 +41,81 @@ type ConsistencyReport = { ok: boolean; message: string };
 
 function nearestEditableFrame(project: Project, time: number) {
   return [...project.keyframes].sort((a, b) => Math.abs(a.time - time) - Math.abs(b.time - time))[0];
+}
+
+const transformDiffers = (a?: Transform, b?: Transform) => !a || !b
+  || Math.abs(a.x - b.x) > 1e-7
+  || Math.abs(a.y - b.y) > 1e-7
+  || Math.abs(shortestAngleDelta(a.rotation, b.rotation)) > 1e-7;
+
+function ComparePanel({ project, action, time, previewRevision }: {
+  project: Project;
+  action: Action;
+  time: number;
+  previewRevision: number | null;
+}) {
+  const localTime = Math.min(time, action.duration);
+  const sourcePose = sampleLocal(project, action.source.range_start + localTime);
+  const columns: { id: string; label: string; keyframes: Action["keyframes"] }[] = [
+    { id: "current", label: `当前动作 r${action.revision ?? 1}`, keyframes: action.keyframes },
+  ];
+  if (previewRevision !== null && previewRevision !== (action.revision ?? 1)) {
+    const revision = action.previous_versions?.find((item) => item.revision === previewRevision);
+    if (revision) columns.push({ id: `rev-${revision.revision}`, label: `旧版本 r${revision.revision}（对应更早源版本）`, keyframes: revision.keyframes });
+  }
+  (action.variants ?? []).forEach((variant) => columns.push({
+    id: variant.id,
+    label: `${variant.name}${variant.status === "published" ? "（已发布）" : "（草稿）"}`,
+    keyframes: variant.keyframes,
+  }));
+  const poses = columns.map((column) => sampleFrames(column.keyframes, localTime));
+  const activeDecisions = (action.decision_log ?? []).filter((entry) => (entry.status ?? "active") === "active");
+  const continuityTargets = [
+    { label: "当前动作", keyframes: action.keyframes, variantId: null as string | null },
+    ...(action.variants ?? []).filter((variant) => variant.status === "draft")
+      .map((variant) => ({ label: variant.name, keyframes: variant.keyframes, variantId: variant.id as string | null })),
+  ];
+  return <div className="compare-panel">
+    <div className="card-title"><h3>方案对比（t = {localTime.toFixed(3)}s）</h3><span>高亮单元格与当前源不同：差异来自人工采用/保留的决定，而非源变化</span></div>
+    <table className="compare-table">
+      <thead>
+        <tr>
+          <th>骨骼</th>
+          <th>源分层工程 v{project.version}</th>
+          {columns.map((column) => <th key={column.id}>{column.label}</th>)}
+        </tr>
+      </thead>
+      <tbody>
+        {action.source.bones.map((boneId) => {
+          const boneName = project.skeleton.bones.find((bone) => bone.id === boneId)?.name ?? boneId;
+          return <tr key={boneId}>
+            <td>{boneName}</td>
+            <td>{sourcePose[boneId]?.rotation.toFixed(1)}°</td>
+            {columns.map((column, columnIndex) => {
+              const cell = poses[columnIndex][boneId];
+              const diff = transformDiffers(cell, sourcePose[boneId]);
+              return <td key={column.id} className={diff ? "diff" : ""}
+                title={diff ? "与当前源不同：来自人工采用或保留的决定" : "与当前源一致"}>
+                {cell ? `${cell.rotation.toFixed(1)}°` : "—"}
+              </td>;
+            })}
+          </tr>;
+        })}
+      </tbody>
+    </table>
+    <div className="continuity-list">
+      {continuityTargets.map((target) => {
+        const windows = activeDecisions
+          .filter((entry) => (entry.variant_id ?? null) === target.variantId)
+          .map((entry) => ({ start: entry.segment.start, end: entry.segment.end }));
+        const report = continuityReport(target.keyframes, action.duration, windows, action.source.fps, action.source.bones);
+        return <span key={target.label} className="continuity-item"
+          title="更新区间内 / 区间边界 / 区间外的最大相邻帧姿态差；边界值与两侧相近则过渡连续">
+          {target.label}：区间内 Δ{report.maxInsideDelta.toFixed(2)} · 边界 Δ{report.maxBoundaryDelta.toFixed(2)} · 区间外 Δ{report.maxOutsideDelta.toFixed(2)}
+        </span>;
+      })}
+    </div>
+  </div>;
 }
 
 export default function App() {
@@ -51,6 +136,8 @@ export default function App() {
   const [segmentChoices, setSegmentChoices] = useState<Record<number, "source" | "keep">>({});
   const [segmentSelected, setSegmentSelected] = useState<Record<number, boolean>>({});
   const [previewRevision, setPreviewRevision] = useState<number | null>(null);
+  const [selectedVariantId, setSelectedVariantId] = useState<string | null>(null);
+  const [withdrawPreview, setWithdrawPreview] = useState<WithdrawalPreview | null>(null);
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -85,13 +172,35 @@ export default function App() {
     if (previewRevision === (activeAction.revision ?? 1)) return activeAction.keyframes;
     return activeAction.previous_versions?.find((item) => item.revision === previewRevision)?.keyframes ?? null;
   }, [activeAction, previewRevision]);
+  const selectedVariant = useMemo<ActionVariant | null>(
+    () => activeAction?.variants?.find((variant) => variant.id === selectedVariantId) ?? null,
+    [activeAction, selectedVariantId],
+  );
   const viewDuration = activeAction?.duration ?? project.duration;
   const viewProject = useMemo<Project>(() => (activeAction ? {
     ...project,
     duration: activeAction.duration,
-    keyframes: previewKeyframes ?? activeAction.keyframes,
+    keyframes: selectedVariant?.keyframes ?? previewKeyframes ?? activeAction.keyframes,
     layers: activeAction.layers ?? [],
-  } : project), [project, activeAction, previewKeyframes]);
+  } : project), [project, activeAction, previewKeyframes, selectedVariant]);
+  const affectedActions = useMemo(
+    () => (project.actions ?? [])
+      .map((action) => ({ action, segments: analyzeRebake(project, action) }))
+      .filter((entry) => entry.segments.length > 0),
+    [project],
+  );
+  const sharedSourceKeys = useMemo(() => {
+    const counts = new Map<string, number>();
+    (project.actions ?? []).forEach((action) => {
+      const key = [action.source.range_start, action.source.range_end, ...action.source.bones].join("|");
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    });
+    return new Set(
+      (project.actions ?? [])
+        .filter((action) => (counts.get([action.source.range_start, action.source.range_end, ...action.source.bones].join("|")) ?? 0) > 1)
+        .map((action) => action.id),
+    );
+  }, [project.actions]);
 
   const frames = useMemo(() => orderedKeyframes(viewProject), [viewProject]);
   const editingFrame = useMemo(() => nearestEditableFrame(viewProject, time), [viewProject, time]);
@@ -244,6 +353,10 @@ export default function App() {
 
   const commitAction = (next: Project, notice?: string) => {
     if (!activeAction) return;
+    if (selectedVariant) {
+      setMessage("正在查看采用方案：方案内容通过返修决定演进，直接编辑请切回当前动作。");
+      return;
+    }
     if (previewRevision !== null && previewRevision !== (activeAction.revision ?? 1)) {
       setMessage("正在回放旧版本，请先切回当前修订再编辑。");
       return;
@@ -251,7 +364,11 @@ export default function App() {
     const updatedAction: Action = {
       ...activeAction,
       duration: next.duration,
-      keyframes: next.keyframes,
+      keyframes: next.keyframes.map((frame) => (
+        frame.origin === "manual" && frame.origin_source_version === undefined
+          ? { ...frame, origin_source_version: activeAction.source.source_version }
+          : frame
+      )),
       layers: next.layers ?? [],
     };
     const full: Project = {
@@ -268,6 +385,8 @@ export default function App() {
     setSegmentChoices({});
     setSegmentSelected({});
     setPreviewRevision(null);
+    setSelectedVariantId(null);
+    setWithdrawPreview(null);
   };
 
   const runRebake = async () => {
@@ -276,20 +395,20 @@ export default function App() {
       .map((segment, index) => ({ segment, index }))
       .filter(({ index }) => segmentSelected[index])
       .map(({ segment, index }) => ({
-        segment: { start: segment.start, end: segment.end },
+        segment: { start: segment.start, end: segment.end, bones: segment.bones },
         resolution: segment.manual ? (segmentChoices[index] ?? "keep") : "source" as "source" | "keep",
-      }))
-      .filter((decision) => decision.resolution === "source");
+      }));
     if (decisions.length === 0) {
-      setMessage("未选择需要采用源动作的区间；保留手工结果无需提交。");
+      setMessage("请先勾选要处理的区间；每个区间分别决定采用源动作或保留手工结果。");
       return;
     }
+    const targetVariant = selectedVariant?.status === "draft" ? selectedVariant : null;
     try {
-      let next = applyRebake(project, activeAction.id, decisions);
+      let next = applyRebake(project, activeAction.id, decisions, targetVariant?.id ?? null);
       try {
         const verified = await api<{ action: Action }>("/api/rebake", {
           method: "POST",
-          body: JSON.stringify({ project, action_id: activeAction.id, decisions }),
+          body: JSON.stringify({ project, action_id: activeAction.id, decisions, variant_id: targetVariant?.id ?? null }),
         });
         next = { ...next, actions: (next.actions ?? []).map((item) => (item.id === activeAction.id ? verified.action : item)) };
       } catch {
@@ -304,10 +423,104 @@ export default function App() {
       setSegmentChoices({});
       setSegmentSelected({});
       const updated = next.actions?.find((item) => item.id === activeAction.id);
-      setReport({ ok: true, message: `已应用 ${decisions.length} 个返修区间，动作修订号升为 r${updated?.revision ?? "?"}；旧版本仍可在下方回放，撤销只回退本次决定。` });
-      setMessage("局部返修完成：未选区间与保留的手工关键帧均未改动。");
+      const adoptedCount = decisions.filter((decision) => decision.resolution === "source").length;
+      const keptCount = decisions.length - adoptedCount;
+      setReport({
+        ok: true,
+        message: targetVariant
+          ? `已在${targetVariant.name}中确认 ${decisions.length} 项决定（采用 ${adoptedCount}、保留手工 ${keptCount}），方案修订升为 r${targetVariant.revision + 1}；当前动作与其他方案不受影响。`
+          : `已确认 ${decisions.length} 项决定（采用 ${adoptedCount}、保留手工 ${keptCount}），动作修订号升为 r${updated?.revision ?? "?"}；旧版本仍可在下方回放，撤销只回退本次决定。`,
+      });
+      setMessage("局部返修完成：未选区间与保留的手工关键帧均未改动，保留结果已记录所依附的源版本。");
     } catch (error) {
       setReport({ ok: false, message: error instanceof Error ? error.message : "返修失败" });
+    }
+  };
+
+  const runCreateVariant = async () => {
+    if (!activeAction) return;
+    try {
+      let next = createVariant(project, activeAction.id);
+      try {
+        const verified = await api<{ action: Action }>("/api/variants", {
+          method: "POST",
+          body: JSON.stringify({ project, action_id: activeAction.id, op: "create" }),
+        });
+        next = { ...next, actions: (next.actions ?? []).map((item) => (item.id === activeAction.id ? verified.action : item)) };
+      } catch {
+        setMessage("Python 服务不可用，已使用本地方案；保存前请启动后端核对。");
+      }
+      const created = next.actions?.find((item) => item.id === activeAction.id)?.variants?.at(-1);
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setSelectedVariantId(created?.id ?? null);
+      setMessage(`已新建${created?.name ?? "方案"}：从当前动作复制，可独立确认采用决定，互不同步。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "新建方案失败");
+    }
+  };
+
+  const runPublishVariant = async () => {
+    if (!activeAction || !selectedVariant || selectedVariant.status !== "draft") return;
+    try {
+      let next = publishVariant(project, activeAction.id, selectedVariant.id);
+      try {
+        const verified = await api<{ action: Action }>("/api/variants", {
+          method: "POST",
+          body: JSON.stringify({ project, action_id: activeAction.id, op: "publish", variant_id: selectedVariant.id }),
+        });
+        next = { ...next, actions: (next.actions ?? []).map((item) => (item.id === activeAction.id ? verified.action : item)) };
+      } catch {
+        setMessage("Python 服务不可用，已使用本地发布结果；保存前请启动后端核对。");
+      }
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      const updated = next.actions?.find((item) => item.id === activeAction.id);
+      setReport({ ok: true, message: `已发布「${selectedVariant.name}」为 r${updated?.revision ?? "?"}；其他方案保持草稿可继续编辑，旧发布版本仍可在回放修订中播放。` });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "发布方案失败");
+    }
+  };
+
+  const runWithdrawPreview = async (decisionId: string) => {
+    if (!activeAction) return;
+    try {
+      let preview = withdrawalPreview(project, activeAction.id, decisionId);
+      try {
+        const verified = await api<{ preview: WithdrawalPreview }>("/api/withdraw", {
+          method: "POST",
+          body: JSON.stringify({ project, action_id: activeAction.id, decision_id: decisionId }),
+        });
+        preview = verified.preview;
+      } catch {
+        // backend unavailable: local preview is identical logic
+      }
+      setWithdrawPreview(preview);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "撤回分析失败");
+    }
+  };
+
+  const runWithdrawConfirm = async () => {
+    if (!activeAction || !withdrawPreview) return;
+    const decisionId = withdrawPreview.decision.id;
+    try {
+      let next = withdrawDecision(project, activeAction.id, decisionId, true);
+      try {
+        const verified = await api<{ action: Action }>("/api/withdraw", {
+          method: "POST",
+          body: JSON.stringify({ project, action_id: activeAction.id, decision_id: decisionId, confirm: true }),
+        });
+        next = { ...next, actions: (next.actions ?? []).map((item) => (item.id === activeAction.id ? verified.action : item)) };
+      } catch {
+        setMessage("Python 服务不可用，已使用本地撤回结果；保存前请启动后端核对。");
+      }
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setWithdrawPreview(null);
+      setReport({ ok: true, message: `已撤回决定 ${decisionId}：仅恢复其自身区间，较晚的无关返修保持不动。` });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "撤回失败");
     }
   };
 
@@ -410,6 +623,16 @@ export default function App() {
             {action.name}（源 v{action.source.source_version} · r{action.revision ?? 1}）
           </button>)}
         </div>
+        {!activeAction && affectedActions.length > 0 && <div className="shared-panel">
+          <strong>源工程 v{project.version} 更新后，{affectedActions.length} 个整理动作受影响（各自独立决定，不会因源相同而强制同步）：</strong>
+          {affectedActions.map(({ action, segments }) => <div key={action.id} className="shared-row">
+            <span>
+              {action.name}：{segments.length} 个受影响区间
+              {sharedSourceKeys.has(action.id) && <em>（与其他动作共享同一段源动作）</em>}
+            </span>
+            <button onClick={() => switchAction(action.id)}>逐段查看并决定</button>
+          </div>)}
+        </div>}
         {activeAction && <>
           <div className="provenance hint">
             <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}（当前源 v{project.version}），
@@ -432,14 +655,35 @@ export default function App() {
             {previewRevision !== null && previewRevision !== (activeAction.revision ?? 1)
               && <span className="hint warn">正在回放旧版本 r{previewRevision}（只读）；切回当前修订后才能编辑。</span>}
           </div>}
+          <div className="variant-bar">
+            <span>采用方案：</span>
+            <button className={selectedVariantId === null ? "chip selected" : "chip"}
+              onClick={() => setSelectedVariantId(null)}>当前动作 r{activeAction.revision ?? 1}</button>
+            {(activeAction.variants ?? []).map((variant) => <button key={variant.id}
+              className={selectedVariantId === variant.id ? "chip selected" : "chip"}
+              onClick={() => setSelectedVariantId(variant.id)}>
+              {variant.name} r{variant.revision}{variant.status === "published" ? "（已发布）" : "（草稿）"}
+            </button>)}
+            <button className="chip" onClick={runCreateVariant}>＋新建方案</button>
+            {selectedVariant?.status === "draft" && <>
+              <button className="primary" onClick={runPublishVariant}>发布「{selectedVariant.name}」</button>
+              <span className="hint">发布只把该方案固化为动作新修订；其他方案继续可编辑，旧发布动作仍能回放。</span>
+            </>}
+            {selectedVariant?.status === "published" && <span className="hint">该方案已发布为动作修订，内容只读。</span>}
+          </div>
           {rebakeSegments.length > 0 && <div className="rebake-panel">
-            <div className="card-title"><h3>源工程已更新：{rebakeSegments.length} 个受影响区间</h3><span>勾选要采用源动作的区间；人工返修帧需单独决定</span></div>
+            <div className="card-title"><h3>源工程已更新：{rebakeSegments.length} 个受影响区间</h3><span>{selectedVariant?.status === "draft" ? `决定将写入「${selectedVariant.name}」` : "决定将写入当前动作"}；人工返修帧需单独决定</span></div>
             {rebakeSegments.map((segment, index) => <div key={index} className={segment.manual ? "rebake-row manual" : "rebake-row"}>
               <label>
                 <input type="checkbox" checked={!!segmentSelected[index]}
                   onChange={(event) => setSegmentSelected((prev) => ({ ...prev, [index]: event.target.checked }))} />
                 {segment.start.toFixed(2)}~{segment.end.toFixed(2)}s · {segment.bones.join("、")}
               </label>
+              {segment.basis.length > 0 && <span className="basis">
+                采用依据：{segment.basis.map((entry) =>
+                  `${entry.id}（${entry.resolution === "keep" ? "保留手工" : "采用源"}·基于 v${entry.source_version}${entry.variant_id ? "·方案内" : ""}）`
+                ).join("、")}
+              </span>}
               {segment.manual && <span className="rebake-choice">
                 <em>含人工返修关键帧：</em>
                 <label><input type="radio" name={"seg-" + index} checked={(segmentChoices[index] ?? "keep") === "keep"}
@@ -448,7 +692,38 @@ export default function App() {
                   onChange={() => setSegmentChoices((prev) => ({ ...prev, [index]: "source" }))} />重新采用源动作</label>
               </span>}
             </div>)}
-            <button className="primary bake-btn" onClick={runRebake}><Scissors size={15} />应用所选返修区间（保留其余决定）</button>
+            <button className="primary bake-btn" onClick={runRebake} disabled={selectedVariant?.status === "published"}>
+              <Scissors size={15} />确认所选区间的决定{selectedVariant?.status === "draft" ? `（写入${selectedVariant.name}）` : ""}
+            </button>
+          </div>}
+          <ComparePanel project={project} action={activeAction} time={time}
+            previewRevision={previewRevision} />
+          {(activeAction.decision_log ?? []).length > 0 && <div className="decision-log">
+            <div className="card-title"><h3>已确认采用决定</h3><span>撤回较早决定前会列出依赖关系，较晚的无关返修不会被抹掉</span></div>
+            {(activeAction.decision_log ?? []).map((entry) => <div key={entry.id}
+              className={entry.status === "withdrawn" ? "decision-row withdrawn" : "decision-row"}>
+              <span>
+                {entry.id} · r{entry.revision} · {entry.segment.start.toFixed(2)}~{entry.segment.end.toFixed(2)}s
+                · {entry.segment.bones.join("、")} · {entry.resolution === "keep" ? "保留手工" : "采用源"}（基于 v{entry.source_version}）
+                {entry.variant_id && ` · 方案 ${entry.variant_id}`}
+                {entry.status === "withdrawn" && " · 已撤回"}
+              </span>
+              {(entry.status ?? "active") === "active" && !entry.variant_id
+                && <button onClick={() => runWithdrawPreview(entry.id)}>撤回…</button>}
+            </div>)}
+            {withdrawPreview && <div className="withdraw-preview">
+              <strong>撤回 {withdrawPreview.decision.id} 的影响分析：</strong>
+              {withdrawPreview.dependents.length > 0
+                ? <p className="hint warn">后续 {withdrawPreview.dependents.length} 项决定与其时间/骨骼相交，撤回会一并影响：
+                  {withdrawPreview.dependents.map((entry) => entry.id).join("、")}</p>
+                : <p className="hint">没有后续决定依赖它。</p>}
+              {withdrawPreview.independent.length > 0
+                ? <p className="hint">仍可独立保留的较晚结果：{withdrawPreview.independent.map((entry) =>
+                    `${entry.id}（${entry.segment.start.toFixed(2)}~${entry.segment.end.toFixed(2)}s）`).join("、")}</p>
+                : <p className="hint">没有其他较晚决定。</p>}
+              <button className="primary" onClick={runWithdrawConfirm}>确认撤回（保留无关返修）</button>
+              <button onClick={() => setWithdrawPreview(null)}>取消</button>
+            </div>}
           </div>}
         </>}
         {!activeAction && <div className="bake-panel">

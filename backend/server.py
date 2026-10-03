@@ -11,13 +11,17 @@ from animation_core import (
     analyze_rebake,
     apply_rebake,
     bake_action,
+    create_variant,
     default_project,
     evaluate_world,
     export_action,
     load_project,
+    publish_variant,
     sample_local,
     save_project,
     validate_project,
+    withdraw_decision,
+    withdrawal_preview,
 )
 
 
@@ -104,10 +108,46 @@ class AnimationHandler(BaseHTTPRequestHandler):
                         self.end_json({"errors": [f"找不到整理动作 {action_id}"]}, HTTPStatus.BAD_REQUEST)
                         return
                     if "decisions" in payload:
-                        updated = apply_rebake(project, action_id, list(payload.get("decisions", [])))
+                        updated = apply_rebake(
+                            project,
+                            action_id,
+                            list(payload.get("decisions", [])),
+                            payload.get("variant_id"),
+                        )
                         self.end_json({"ok": True, "action": updated})
                     else:
                         self.end_json({"ok": True, "segments": analyze_rebake(project, action)})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/variants":
+                try:
+                    project = payload["project"]
+                    action_id = str(payload["action_id"])
+                    op = str(payload.get("op", "create"))
+                    if op == "create":
+                        updated = create_variant(
+                            project, action_id, str(payload.get("name", "")), payload.get("variant_id"),
+                        )
+                    elif op == "publish":
+                        updated = publish_variant(project, action_id, str(payload["variant_id"]))
+                    else:
+                        self.end_json({"errors": [f"未知方案操作 {op}"]}, HTTPStatus.BAD_REQUEST)
+                        return
+                    self.end_json({"ok": True, "action": updated})
+                except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/withdraw":
+                try:
+                    project = payload["project"]
+                    action_id = str(payload["action_id"])
+                    decision_id = str(payload["decision_id"])
+                    if payload.get("confirm"):
+                        updated = withdraw_decision(project, action_id, decision_id, confirm=True)
+                        self.end_json({"ok": True, "action": updated})
+                    else:
+                        self.end_json({"ok": True, "preview": withdrawal_preview(project, action_id, decision_id)})
                 except (KeyError, TypeError, ValueError) as exc:
                     self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
                 return

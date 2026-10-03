@@ -5,7 +5,13 @@ export type Bone = {
   parent: string | null;
   rest: { x: number; y: number };
 };
-export type Keyframe = { id: string; time: number; pose: Record<string, Transform>; origin?: "baked" | "manual" };
+export type Keyframe = {
+  id: string;
+  time: number;
+  pose: Record<string, Transform>;
+  origin?: "baked" | "manual";
+  origin_source_version?: number;
+};
 export type Layer = {
   id: string;
   name: string;
@@ -30,6 +36,25 @@ export type BakedSource = {
   updated_at?: string;
 };
 export type ActionRevision = { revision: number; keyframes: Keyframe[]; saved_at: string };
+export type DecisionRecord = {
+  id: string;
+  revision: number;
+  variant_id?: string | null;
+  segment: { start: number; end: number; bones: string[] };
+  resolution: "source" | "keep";
+  source_version: number;
+  status?: "active" | "withdrawn";
+  created_at?: string;
+};
+export type ActionVariant = {
+  id: string;
+  name: string;
+  status: "draft" | "published";
+  keyframes: Keyframe[];
+  revision: number;
+  created_at?: string;
+  published_at?: string;
+};
 export type Action = {
   id: string;
   name: string;
@@ -38,6 +63,8 @@ export type Action = {
   layers?: Layer[];
   revision?: number;
   previous_versions?: ActionRevision[];
+  decision_log?: DecisionRecord[];
+  variants?: ActionVariant[];
   source: BakedSource;
 };
 export type Project = {
@@ -62,6 +89,10 @@ export function validateClipContent(clip: { keyframes: Keyframe[]; layers?: Laye
   clip.keyframes.forEach((frame) => {
     if (!Number.isFinite(frame.time) || frame.time < 0) errors.push(`${prefix}关键姿态 ${frame.id} 时间必须是非负数字`);
     if (frame.time > duration) errors.push(`${prefix}关键姿态 ${frame.id} 的时间 ${frame.time} 超出动作时长`);
+    if (frame.origin_source_version !== undefined
+        && (!Number.isInteger(frame.origin_source_version) || frame.origin_source_version < 1)) {
+      errors.push(`${prefix}关键姿态 ${frame.id} 的 origin_source_version 必须是正整数`);
+    }
     if (times.has(frame.time)) errors.push(`关键姿态时间不能重复：${frame.time}`);
     times.add(frame.time);
     bones.forEach((bone) => {
@@ -178,6 +209,31 @@ export function validateProject(project: Project): string[] {
     if (!source?.bones.length) errors.push(`${prefix}缺少整理骨骼范围`);
     else source.bones.forEach((boneId) => {
       if (!byId.has(boneId)) errors.push(`${prefix}的整理骨骼范围包含未知骨骼 ${boneId}`);
+    });
+    const decisionIds = new Set<string>();
+    (action.decision_log ?? []).forEach((entry, entryIndex) => {
+      const entryPrefix = `${prefix}第 ${entryIndex + 1} 条采用决定`;
+      if (!entry.id) errors.push(`${entryPrefix}缺少有效 id`);
+      else if (decisionIds.has(entry.id)) errors.push(`${entryPrefix}id 重复：${entry.id}`);
+      else decisionIds.add(entry.id);
+      if (entry.resolution !== "source" && entry.resolution !== "keep") errors.push(`${entryPrefix}的决定必须是 source 或 keep`);
+      if (entry.status !== undefined && entry.status !== "active" && entry.status !== "withdrawn") {
+        errors.push(`${entryPrefix}的状态必须是 active 或 withdrawn`);
+      }
+      if (!Number.isInteger(entry.source_version) || entry.source_version < 1) errors.push(`${entryPrefix}缺少采用依据的源版本号`);
+      if (!Number.isFinite(entry.segment?.start) || !Number.isFinite(entry.segment?.end)
+          || entry.segment.end < entry.segment.start) errors.push(`${entryPrefix}的时间区间无效`);
+    });
+    const variantIds = new Set<string>();
+    (action.variants ?? []).forEach((variant, variantIndex) => {
+      const variantPrefix = `${prefix}第 ${variantIndex + 1} 个采用方案`;
+      if (!variant.id) errors.push(`${variantPrefix}缺少有效 id`);
+      else if (variantIds.has(variant.id)) errors.push(`${variantPrefix}id 重复：${variant.id}`);
+      else variantIds.add(variant.id);
+      if (!variant.name) errors.push(`${variantPrefix}缺少名称`);
+      if (variant.status !== "draft" && variant.status !== "published") errors.push(`${variantPrefix}的状态必须是 draft 或 published`);
+      if (!Number.isInteger(variant.revision) || variant.revision < 1) errors.push(`${variantPrefix}的修订号必须是正整数`);
+      errors.push(...validateClipContent({ keyframes: variant.keyframes, layers: [] }, action.duration, bones, `${variantPrefix}内`));
     });
     errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`));
   });
@@ -389,6 +445,8 @@ export function bakeAction(
     layers: [],
     revision: 1,
     previous_versions: [],
+    decision_log: [],
+    variants: [],
     source: {
       action_id: "__main__",
       source_version: project.version,
@@ -420,11 +478,28 @@ export function migrateProject(project: Project): Project {
   next.actions.forEach((action) => {
     if (!Number.isInteger(action.revision)) action.revision = 1;
     if (!action.previous_versions) action.previous_versions = [];
+    if (!action.decision_log) action.decision_log = [];
+    if (!action.variants) action.variants = [];
   });
   return next;
 }
 
-export type RebakeSegment = { start: number; end: number; bones: string[]; manual: boolean };
+export type DecisionBasis = {
+  id: string;
+  revision?: number;
+  resolution?: "source" | "keep";
+  source_version?: number;
+  variant_id?: string | null;
+};
+export type RebakeSegment = { start: number; end: number; bones: string[]; manual: boolean; basis: DecisionBasis[] };
+
+const segmentsIntersect = (
+  first: { start: number; end: number; bones: string[] },
+  second: { start: number; end: number; bones?: string[] },
+) => {
+  if (first.start > second.end + 1e-9 || second.start > first.end + 1e-9) return false;
+  return first.bones.some((boneId) => (second.bones ?? []).includes(boneId));
+};
 
 const transformDiffers = (a: Transform, b: Transform, tolerance = 1e-7) =>
   Math.abs(a.x - b.x) > tolerance
@@ -446,7 +521,7 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
     if (differing.length === 0) continue;
     cells.push({ index, time: localTime, bones: differing, manual: keyframeByIndex.get(index)?.origin === "manual" });
   }
-  const segments: (RebakeSegment & { lastIndex: number })[] = [];
+  const segments: (Omit<RebakeSegment, "basis"> & { lastIndex: number })[] = [];
   cells.forEach((cell) => {
     const last = segments[segments.length - 1];
     if (last && cell.index === last.lastIndex + 1 && cell.manual === last.manual) {
@@ -457,20 +532,40 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
       segments.push({ lastIndex: cell.index, start: cell.time, end: cell.time, bones: [...cell.bones], manual: cell.manual });
     }
   });
-  return segments.map(({ start, end, bones: segmentBones, manual }) => ({ start, end, bones: segmentBones, manual }));
+  const activeDecisions = (action.decision_log ?? []).filter((entry) => (entry.status ?? "active") === "active");
+  return segments.map(({ start, end, bones: segmentBones, manual }) => ({
+    start,
+    end,
+    bones: segmentBones,
+    manual,
+    basis: activeDecisions
+      .filter((entry) => segmentsIntersect({ start, end, bones: segmentBones }, entry.segment))
+      .map((entry) => ({
+        id: entry.id,
+        revision: entry.revision,
+        resolution: entry.resolution,
+        source_version: entry.source_version,
+        variant_id: entry.variant_id ?? null,
+      })),
+  }));
 }
 
-export type RebakeDecision = { segment: { start: number; end: number }; resolution: "source" | "keep" };
+export type RebakeDecision = { segment: { start: number; end: number; bones?: string[] }; resolution: "source" | "keep" };
 
-export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[]): Project {
+export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[], variantId?: string | null): Project {
   const action = project.actions?.find((item) => item.id === actionId);
   if (!action) throw new Error(`找不到整理动作 ${actionId}`);
-  const adopted = decisions.filter((decision) => decision.resolution === "source");
-  if (adopted.length === 0) throw new Error("没有需要应用的返修区间");
+  const confirmed = decisions.filter((decision) => decision.resolution === "source" || decision.resolution === "keep");
+  if (confirmed.length === 0) throw new Error("没有需要应用的返修区间");
+  const adopted = confirmed.filter((decision) => decision.resolution === "source");
+  const keeps = confirmed.filter((decision) => decision.resolution === "keep");
   const { fps, range_start: rangeStart, bones } = action.source;
   const span = action.duration;
-  let keyframes = action.keyframes.map((frame) => ({ ...frame, pose: structuredClone(frame.pose) }));
-  const revision = (action.revision ?? 1) + 1;
+  const variant = variantId == null ? null : action.variants?.find((item) => item.id === variantId) ?? null;
+  if (variantId != null && !variant) throw new Error(`找不到方案 ${variantId}`);
+  if (variant && variant.status !== "draft") throw new Error(`方案「${variant.name}」已发布，不能再编辑`);
+  let keyframes = (variant ? variant.keyframes : action.keyframes).map((frame) => ({ ...frame, pose: structuredClone(frame.pose) }));
+  const revision = ((variant ? variant.revision : action.revision) ?? 1) + 1;
   adopted.forEach(({ segment }) => {
     const { start, end } = segment;
     if (!(end >= start) || start < -1e-9 || end > span + 1e-9) throw new Error(`返修区间 ${start}~${end}s 无效`);
@@ -488,11 +583,49 @@ export function applyRebake(project: Project, actionId: string, decisions: Rebak
       });
     }
   });
+  keeps.forEach(({ segment }) => {
+    const { start, end } = segment;
+    if (!(end >= start) || start < -1e-9 || end > span + 1e-9) throw new Error(`保留区间 ${start}~${end}s 无效`);
+    keyframes.forEach((frame) => {
+      if (frame.time >= start - 1e-9 && frame.time <= end + 1e-9 && frame.origin === "manual") {
+        frame.origin_source_version = project.version;
+      }
+    });
+  });
   keyframes.sort((a, b) => a.time - b.time);
+  const newEntries: DecisionRecord[] = confirmed.map((decision, index) => ({
+    id: `${actionId}-d${(action.decision_log ?? []).length + index + 1}`,
+    revision,
+    variant_id: variantId ?? null,
+    segment: {
+      start: decision.segment.start,
+      end: decision.segment.end,
+      bones: [...(decision.segment.bones ?? action.source.bones)],
+    },
+    resolution: decision.resolution,
+    source_version: project.version,
+    status: "active",
+    created_at: new Date().toISOString(),
+  }));
+  const decisionLog = [...(action.decision_log ?? []), ...newEntries];
+  if (variant) {
+    const updatedAction: Action = {
+      ...structuredClone(action),
+      decision_log: decisionLog,
+      variants: (action.variants ?? []).map((item) => (item.id === variant.id
+        ? { ...item, keyframes, revision }
+        : item)),
+    };
+    return {
+      ...project,
+      actions: (project.actions ?? []).map((item) => (item.id === actionId ? updatedAction : item)),
+    };
+  }
   const updated: Action = {
     ...structuredClone(action),
     keyframes,
     revision,
+    decision_log: decisionLog,
     previous_versions: [
       ...(action.previous_versions ?? []),
       { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
@@ -504,6 +637,149 @@ export function applyRebake(project: Project, actionId: string, decisions: Rebak
     ...project,
     actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)),
   };
+}
+
+export function createVariant(project: Project, actionId: string, name = ""): Project {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  const variants = [...(action.variants ?? [])];
+  const id = `${actionId}-var-${variants.length + 1}`;
+  if (variants.some((item) => item.id === id)) throw new Error(`方案 id 重复：${id}`);
+  variants.push({
+    id,
+    name: name || `方案 ${variants.length + 1}`,
+    status: "draft",
+    keyframes: structuredClone(action.keyframes),
+    revision: 1,
+    created_at: new Date().toISOString(),
+  });
+  const updated: Action = { ...structuredClone(action), variants };
+  return { ...project, actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)) };
+}
+
+export function publishVariant(project: Project, actionId: string, variantId: string): Project {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  const variant = action.variants?.find((item) => item.id === variantId);
+  if (!variant) throw new Error(`找不到方案 ${variantId}`);
+  if (variant.status !== "draft") throw new Error(`方案「${variant.name}」已发布过`);
+  const updated: Action = {
+    ...structuredClone(action),
+    keyframes: structuredClone(variant.keyframes),
+    revision: (action.revision ?? 1) + 1,
+    previous_versions: [
+      ...(action.previous_versions ?? []),
+      { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
+    ],
+    variants: (action.variants ?? []).map((item) => (item.id === variantId
+      ? { ...item, status: "published" as const, published_at: new Date().toISOString() }
+      : item)),
+    source: { ...action.source, updated_at: new Date().toISOString() },
+  };
+  if (analyzeRebake(project, updated).length === 0) updated.source.source_version = project.version;
+  return { ...project, actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)) };
+}
+
+export type WithdrawalPreview = {
+  decision: DecisionRecord;
+  dependents: DecisionRecord[];
+  independent: DecisionRecord[];
+};
+
+export function withdrawalPreview(project: Project, actionId: string, decisionId: string): WithdrawalPreview {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  const log = action.decision_log ?? [];
+  const index = log.findIndex((entry) => entry.id === decisionId);
+  if (index < 0) throw new Error(`找不到采用决定 ${decisionId}`);
+  const decision = log[index];
+  if ((decision.status ?? "active") !== "active") throw new Error(`决定 ${decisionId} 已被撤回`);
+  const later = log.slice(index + 1).filter((entry) => (entry.status ?? "active") === "active");
+  const dependents = later.filter((entry) => segmentsIntersect(decision.segment, entry.segment));
+  const independent = later.filter((entry) => !dependents.includes(entry));
+  return { decision, dependents, independent };
+}
+
+export function withdrawDecision(project: Project, actionId: string, decisionId: string, confirm = false): Project {
+  const action = project.actions?.find((item) => item.id === actionId);
+  if (!action) throw new Error(`找不到整理动作 ${actionId}`);
+  const preview = withdrawalPreview(project, actionId, decisionId);
+  const { decision, dependents } = preview;
+  if (decision.variant_id) throw new Error("方案内的决定请通过继续编辑该方案处理，不能单独撤回");
+  if (dependents.length > 0 && !confirm) {
+    throw new Error(`该决定被后续决定依赖（${dependents.map((entry) => entry.id).join("、")}），确认后才会撤回`);
+  }
+  const { start, end } = decision.segment;
+  const snapshot = (action.previous_versions ?? []).find((item) => item.revision === decision.revision - 1);
+  if (!snapshot) throw new Error("缺少该决定应用前的版本快照，无法安全撤回");
+  const restored = snapshot.keyframes
+    .filter((frame) => frame.time >= start - 1e-9 && frame.time <= end + 1e-9)
+    .map((frame) => structuredClone(frame));
+  const keyframes = [
+    ...action.keyframes.filter((frame) => frame.time < start - 1e-9 || frame.time > end + 1e-9)
+      .map((frame) => ({ ...frame, pose: structuredClone(frame.pose) })),
+    ...restored,
+  ].sort((a, b) => a.time - b.time);
+  const updated: Action = {
+    ...structuredClone(action),
+    keyframes,
+    revision: (action.revision ?? 1) + 1,
+    previous_versions: [
+      ...(action.previous_versions ?? []),
+      { revision: action.revision ?? 1, keyframes: structuredClone(action.keyframes), saved_at: new Date().toISOString() },
+    ],
+    decision_log: (action.decision_log ?? []).map((entry) => (entry.id === decisionId
+      ? { ...entry, status: "withdrawn" as const }
+      : entry)),
+    source: { ...action.source, updated_at: new Date().toISOString() },
+  };
+  return { ...project, actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)) };
+}
+
+export type ContinuityReport = {
+  maxInsideDelta: number;
+  maxBoundaryDelta: number;
+  maxOutsideDelta: number;
+  boundaries: { time: number; delta: number }[];
+};
+
+const poseDelta = (a: Record<string, Transform>, b: Record<string, Transform>, bones: string[]) =>
+  Math.max(...bones.map((boneId) => {
+    const first = a[boneId];
+    const second = b[boneId];
+    if (!first || !second) return 0;
+    return Math.max(
+      Math.abs(first.x - second.x),
+      Math.abs(first.y - second.y),
+      Math.abs(shortestAngleDelta(first.rotation, second.rotation)),
+    );
+  }), 0);
+
+/** Check pose continuity inside, outside and across the edges of update windows. */
+export function continuityReport(
+  keyframes: Keyframe[],
+  duration: number,
+  windows: { start: number; end: number }[],
+  fps: number,
+  bones: string[],
+): ContinuityReport {
+  const count = Math.round(duration * fps) + 1;
+  const poses = Array.from({ length: count }, (_, index) => sampleFrames(keyframes, Math.min(index / fps, duration)));
+  const inWindow = (time: number) => windows.some((window) => time >= window.start - 1e-9 && time <= window.end + 1e-9);
+  const report: ContinuityReport = { maxInsideDelta: 0, maxBoundaryDelta: 0, maxOutsideDelta: 0, boundaries: [] };
+  for (let index = 1; index < count; index += 1) {
+    const time = Math.min(index / fps, duration);
+    const delta = poseDelta(poses[index - 1], poses[index], bones);
+    const wasInside = inWindow(Math.min((index - 1) / fps, duration));
+    const isInside = inWindow(time);
+    if (wasInside && isInside) report.maxInsideDelta = Math.max(report.maxInsideDelta, delta);
+    else if (!wasInside && !isInside) report.maxOutsideDelta = Math.max(report.maxOutsideDelta, delta);
+    else {
+      report.maxBoundaryDelta = Math.max(report.maxBoundaryDelta, delta);
+      report.boundaries.push({ time, delta });
+    }
+  }
+  return report;
 }
 
 export function addWeightKey(project: Project, layerId: string, time: number, weight: number): Project {
