@@ -8,6 +8,8 @@ from animation_core import (
     analyze_rebake,
     apply_rebake,
     bake_action,
+    cancel_review_item,
+    create_review_batch,
     create_variant,
     default_project,
     evaluate_world,
@@ -16,7 +18,10 @@ from animation_core import (
     load_project,
     migrate_project,
     publish_variant,
+    review_batch_summary,
     sample_local,
+    set_review_item_decisions,
+    submit_review_batch,
     weight_key_multiplier,
     shortest_angle_delta,
     validate_project,
@@ -451,6 +456,145 @@ class AnimationCoreTests(unittest.TestCase):
             withdraw_decision(project, "walk", log[0]["id"])
         withdrawn = withdraw_decision(project, "walk", log[0]["id"], confirm=True)
         self.assertEqual(withdrawn["decision_log"][0]["status"], "withdrawn")
+
+
+    def test_review_batch_covers_two_shared_actions_with_independent_drafts(self):
+        project, _ = self._project_with_shared_source_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+
+        opened = create_review_batch(project, batch_id="b1")
+        batch = opened["review_batches"][-1]
+        self.assertEqual(batch["status"], "open")
+        self.assertEqual([item["action_id"] for item in batch["items"]], ["walk", "turn"])
+        walk_draft = batch["items"][0]["variant_id"]
+        turn_draft = batch["items"][1]["variant_id"]
+        self.assertNotEqual(walk_draft, turn_draft)
+        # two independent drafts for two actions sharing the same source
+        walk_action = next(item for item in opened["actions"] if item["id"] == "walk")
+        turn_action = next(item for item in opened["actions"] if item["id"] == "turn")
+        self.assertTrue(any(item["id"] == walk_draft for item in walk_action["variants"]))
+        self.assertTrue(any(item["id"] == turn_draft for item in turn_action["variants"]))
+        self.assertTrue(all(item["status"] == "open" for item in batch["items"]))
+        self.assertTrue(all(segment["resolution"] == "pending" for item in batch["items"] for segment in item["segments"]))
+
+        # decide only the walk item; turn stays pending and the project is saved
+        walk_segments = batch["items"][0]["segments"]
+        decided = set_review_item_decisions(
+            opened, "b1", "walk",
+            {str(index): "source" for index in range(len(walk_segments))},
+        )
+        batch = next(item for item in decided["review_batches"] if item["id"] == "b1")
+        self.assertEqual(batch["items"][0]["status"], "decided")
+        self.assertEqual(batch["items"][1]["status"], "open")
+        walk_action = next(item for item in decided["actions"] if item["id"] == "walk")
+        self.assertEqual(walk_action["revision"], 1)
+        walk_variant = next(item for item in walk_action["variants"] if item["id"] == walk_draft)
+        self.assertEqual(walk_variant["revision"], len(walk_segments) + 1)
+        self.assertTrue(all(entry["batch_id"] == "b1" for entry in walk_action["decision_log"]))
+
+        # submit publishes only the decided item; pending turn draft survives
+        submitted = submit_review_batch(decided, "b1")
+        batch = next(item for item in submitted["review_batches"] if item["id"] == "b1")
+        self.assertEqual(batch["status"], "partially_submitted")
+        self.assertEqual([item["status"] for item in batch["items"]], ["published", "open"])
+        walk_action = next(item for item in submitted["actions"] if item["id"] == "walk")
+        turn_action = next(item for item in submitted["actions"] if item["id"] == "turn")
+        self.assertEqual(walk_action["revision"], 2)
+        self.assertEqual(turn_action["revision"], 1)
+        self.assertTrue(any(item["id"] == walk_draft and item["status"] == "published" for item in walk_action["variants"]))
+        turn_draft_variant = next(item for item in turn_action["variants"] if item["id"] == turn_draft)
+        self.assertEqual(turn_draft_variant["status"], "draft")
+        self.assertTrue(any(segment["resolution"] == "pending" for segment in batch["items"][1]["segments"]))
+
+        # save/reload keeps the batch open for the pending item
+        round_trip = json.loads(json.dumps(submitted))
+        self.assertEqual(validate_project(round_trip), [])
+        resumed = review_batch_summary(
+            migrate_project(round_trip), "b1",
+        )
+        self.assertEqual(resumed["items"][0]["status"], "published")
+        self.assertTrue(resumed["items"][1]["segments"])
+
+    def test_review_batch_resumes_after_another_source_revision_and_cancel(self):
+        project, _ = self._project_with_shared_source_actions()
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        opened = create_review_batch(project, batch_id="b1")
+        walk_segments = opened["review_batches"][-1]["items"][0]["segments"]
+        turn_segments = opened["review_batches"][-1]["items"][1]["segments"]
+        decided = set_review_item_decisions(
+            opened, "b1", "walk",
+            {str(index): "source" for index in range(len(walk_segments))},
+        )
+        submitted = submit_review_batch(decided, "b1")
+        walk_after = next(item for item in submitted["actions"] if item["id"] == "walk")
+        walk_published_revision = walk_after["revision"]
+
+        # source revised again: the still-pending turn item gains more segments
+        # (bases from the first revision remain), and the batch can continue
+        submitted["version"] = 3
+        submitted["layers"][0]["keyframes"][0]["pose"]["upper_arm_r"]["rotation"] = 300.0
+        resumed = review_batch_summary(submitted, "b1")
+        turn_item = resumed["items"][1]
+        self.assertTrue(all(segment["resolution"] == "pending" for segment in turn_item["segments"]))
+        self.assertTrue(len(turn_item["segments"]) >= 1)
+
+        # make a decision on turn, then cancel it: draft resets, decision log
+        # entries for this batch item disappear, but walk's published result and
+        # its other-batch/published decisions remain intact
+        with_choice = set_review_item_decisions(
+            submitted, "b1", "turn",
+            {str(index): "source" for index in range(len(turn_item["segments"]))},
+        )
+        turn_action = next(item for item in with_choice["actions"] if item["id"] == "turn")
+        self.assertTrue(turn_action["decision_log"])
+        cancelled = cancel_review_item(with_choice, "b1", "turn")
+        turn_action = next(item for item in cancelled["actions"] if item["id"] == "turn")
+        turn_draft = next(
+            item for item in cancelled["review_batches"][-1]["items"] if item["action_id"] == "turn"
+        )["variant_id"]
+        draft = next(item for item in turn_action["variants"] if item["id"] == turn_draft)
+        self.assertEqual(draft["revision"], 1)
+        self.assertEqual(draft["keyframes"], turn_action["keyframes"])
+        self.assertFalse(any(entry.get("batch_id") == "b1" for entry in turn_action["decision_log"]))
+        self.assertTrue(all(segment["resolution"] == "pending" for segment in cancelled["review_batches"][-1]["items"][1]["segments"]))
+        walk_action = next(item for item in cancelled["actions"] if item["id"] == "walk")
+        self.assertEqual(walk_action["revision"], walk_published_revision)
+        self.assertTrue(any(entry["batch_id"] == "b1" for entry in walk_action["decision_log"]))
+
+    def test_review_batch_keeps_keep_decisions_and_their_basis_pending(self):
+        project, _ = self._project_with_shared_source_actions()
+        walk = project["actions"][0]
+        walk["keyframes"][10]["pose"]["spine"]["rotation"] = 45.0
+        walk["keyframes"][10]["origin"] = "manual"
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        opened = create_review_batch(project, batch_id="b1")
+        segments = opened["review_batches"][-1]["items"][0]["segments"]
+        manual_index = next(index for index, segment in enumerate(segments) if segment["manual"])
+        resolutions = {
+            str(index): ("keep" if index == manual_index else "source")
+            for index in range(len(segments))
+        }
+        decided = set_review_item_decisions(opened, "b1", "walk", resolutions)
+        walk_item = next(item for item in decided["review_batches"][-1]["items"] if item["action_id"] == "walk")
+        self.assertEqual(walk_item["segments"][manual_index]["resolution"], "keep")
+        walk_action = next(item for item in decided["actions"] if item["id"] == "walk")
+        draft_id = walk_item["variant_id"]
+        draft = next(item for item in walk_action["variants"] if item["id"] == draft_id)
+        kept = [frame for frame in draft["keyframes"] if frame.get("origin") == "manual"]
+        self.assertTrue(kept)
+        self.assertTrue(all(frame["origin_source_version"] == 2 for frame in kept))
+        self.assertEqual(walk_action["revision"], 1)
+        # pending sibling prevents submit-without-decision errors but walk can publish
+        submitted = submit_review_batch(decided, "b1")
+        walk_action = next(item for item in submitted["actions"] if item["id"] == "walk")
+        self.assertEqual(walk_action["revision"], 2)
+        self.assertEqual(
+            [frame for frame in walk_action["keyframes"] if frame.get("origin") == "manual"],
+            kept,
+        )
 
 
 if __name__ == "__main__":

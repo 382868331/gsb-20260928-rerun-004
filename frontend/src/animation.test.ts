@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, continuityReport, createVariant, evaluateWorld, exportAction, layerEnvelope, migrateProject, publishVariant, removeWeightKey, sampleFrames, sampleLocal, shortestAngleDelta, updatePose, updateWeightKey, validateProject, weightKeyMultiplier, withdrawDecision, withdrawalPreview } from "./animation";
+import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, cancelReviewItem, continuityReport, createReviewBatch, createVariant, evaluateWorld, exportAction, layerEnvelope, migrateProject, publishVariant, removeWeightKey, reviewBatchSummary, sampleFrames, sampleLocal, setReviewItemDecisions, shortestAngleDelta, submitReviewBatch, updatePose, updateWeightKey, validateProject, weightKeyMultiplier, withdrawDecision, withdrawalPreview } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -358,6 +358,101 @@ describe("animation core", () => {
     expect(() => withdrawDecision(project, action.id, log[0].id)).toThrow("依赖");
     project = withdrawDecision(project, action.id, log[0].id, true);
     expect(project.actions![0].decision_log![0].status).toBe("withdrawn");
+  });
+
+  it("reviews two shared-source actions in one batch with two independent drafts", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const walk = bakeAction(defaultProject, 0, 1.2, bones, "走路上身").action;
+    walk.id = "walk";
+    const turn = bakeAction(defaultProject, 0, 1.2, bones, "转身上身").action;
+    turn.id = "turn";
+    let project: typeof defaultProject = {
+      ...structuredClone(defaultProject), actions: [walk, turn],
+    };
+    project.version = 2;
+    project.keyframes[1].pose.spine.rotation = 9;
+
+    project = createReviewBatch(project, undefined, "b1");
+    let batch = project.review_batches![0];
+    expect(batch.items.map((item) => item.action_id)).toEqual(["walk", "turn"]);
+    const [walkItem, turnItem] = batch.items;
+    expect(walkItem.variant_id).not.toBe(turnItem.variant_id);
+    expect(batch.items.every((item) => item.status === "open")).toBe(true);
+
+    // decide walk only; turn stays pending
+    project = setReviewItemDecisions(
+      project, "b1", "walk",
+      Object.fromEntries(walkItem.segments.map((_, index) => [index, "source" as const])),
+    );
+    batch = project.review_batches![0];
+    expect(batch.status).toBe("open");
+    expect(batch.items[0].status).toBe("decided");
+    expect(batch.items[1].status).toBe("open");
+    const walkAction = project.actions!.find((action) => action.id === "walk")!;
+    expect(walkAction.revision).toBe(1);
+    expect(walkAction.decision_log!.every((entry) => entry.batch_id === "b1")).toBe(true);
+
+    // submit publishes only walk; turn and its draft are saved
+    project = submitReviewBatch(project, "b1");
+    batch = project.review_batches![0];
+    expect(batch.status).toBe("partially_submitted");
+    expect(batch.items.map((item) => item.status)).toEqual(["published", "open"]);
+    const turnAction = project.actions!.find((action) => action.id === "turn")!;
+    expect(turnAction.revision).toBe(1);
+    expect(turnAction.variants![0].status).toBe("draft");
+
+    // save/reload: batch can be resumed
+    const reloaded = migrateProject(structuredClone(project));
+    expect(validateProject(reloaded)).toHaveLength(0);
+    const resumed = reviewBatchSummary(reloaded, "b1");
+    expect(resumed.items[0].status).toBe("published");
+    expect(resumed.items[1].segments.length).toBeGreaterThan(0);
+  });
+
+  it("continues a partially submitted batch after another revision and cancel keeps published results", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const walk = bakeAction(defaultProject, 0, 1.2, bones, "走路上身").action;
+    walk.id = "walk";
+    const turn = bakeAction(defaultProject, 0, 1.2, bones, "转身上身").action;
+    turn.id = "turn";
+    let project: typeof defaultProject = {
+      ...structuredClone(defaultProject), actions: [walk, turn],
+    };
+    project.version = 2;
+    project.keyframes[1].pose.spine.rotation = 9;
+    project = createReviewBatch(project, undefined, "b1");
+    const walkSegments = project.review_batches![0].items[0].segments;
+    project = setReviewItemDecisions(
+      project, "b1", "walk",
+      Object.fromEntries(walkSegments.map((_, index) => [index, "source" as const])),
+    );
+    project = submitReviewBatch(project, "b1");
+    const publishedRevision = project.actions!.find((action) => action.id === "walk")!.revision;
+
+    // another source revision while turn is still pending
+    project.version = 3;
+    project.layers![0].keyframes[0].pose.upper_arm_r.rotation = 300;
+    const resumed = reviewBatchSummary(project, "b1");
+    expect(resumed.items[1].segments.length).toBeGreaterThan(0);
+    expect(resumed.items[1].segments.every((segment) => segment.resolution === "pending")).toBe(true);
+
+    // decide turn then cancel: draft is reset and batch log entries removed;
+    // walk's published revision from the same batch is untouched
+    project = setReviewItemDecisions(
+      project, "b1", "turn",
+      Object.fromEntries(resumed.items[1].segments.map((_, index) => [index, "source" as const])),
+    );
+    expect(project.actions!.find((action) => action.id === "turn")!.decision_log!.length).toBeGreaterThan(0);
+    project = cancelReviewItem(project, "b1", "turn");
+    const turnAction = project.actions!.find((action) => action.id === "turn")!;
+    expect(turnAction.decision_log).toHaveLength(0);
+    const turnDraft = turnAction.variants![0];
+    expect(turnDraft.revision).toBe(1);
+    expect(turnDraft.keyframes).toEqual(turnAction.keyframes);
+    const walkAction = project.actions!.find((action) => action.id === "walk")!;
+    expect(walkAction.revision).toBe(publishedRevision);
+    expect(walkAction.decision_log!.some((entry) => entry.batch_id === "b1")).toBe(true);
+    expect(project.review_batches![0].items[1].segments.every((segment) => segment.resolution === "pending")).toBe(true);
   });
 
   it("checks pose continuity inside and across update window boundaries", () => {

@@ -450,6 +450,56 @@ def validate_project(project: dict[str, Any]) -> list[str]:
                 ))
         errors.extend(validate_clip(action, action_duration, skeleton, prefix=prefix + "内"))
 
+    review_batches = project.get("review_batches", [])
+    if review_batches is None:
+        review_batches = []
+    if not isinstance(review_batches, list):
+        errors.append("审阅批次必须是数组")
+    else:
+        batch_ids: set[str] = set()
+        for batch_index, batch in enumerate(review_batches):
+            batch_prefix = f"第 {batch_index + 1} 个审阅批次"
+            if not isinstance(batch, dict):
+                errors.append(f"{batch_prefix}必须是对象")
+                continue
+            batch_id = batch.get("id")
+            if not isinstance(batch_id, str) or not batch_id.strip():
+                errors.append(f"{batch_prefix}缺少有效 id")
+            elif batch_id in batch_ids:
+                errors.append(f"{batch_prefix}id 重复：{batch_id}")
+            else:
+                batch_ids.add(batch_id)
+            if batch.get("status") not in ("open", "decided", "partially_submitted", "published"):
+                errors.append(f"{batch_prefix}的状态无效")
+            items = batch.get("items", [])
+            if not isinstance(items, list) or not items:
+                errors.append(f"{batch_prefix}至少包含一个受影响动作")
+                continue
+            for item_index, item in enumerate(items):
+                item_prefix = f"{batch_prefix}第 {item_index + 1} 项"
+                if not isinstance(item, dict):
+                    errors.append(f"{item_prefix}必须是对象")
+                    continue
+                if item.get("action_id") not in action_ids:
+                    errors.append(f"{item_prefix}引用了不存在的动作")
+                if not isinstance(item.get("variant_id"), str) or not item["variant_id"].strip():
+                    errors.append(f"{item_prefix}缺少批次草稿 id")
+                if item.get("status") not in ("open", "decided", "published", "missing"):
+                    errors.append(f"{item_prefix}的状态无效")
+                segments = item.get("segments", [])
+                if not isinstance(segments, list):
+                    errors.append(f"{item_prefix}的区间必须是数组")
+                    continue
+                for segment_index, segment in enumerate(segments):
+                    segment_prefix = f"{item_prefix}第 {segment_index + 1} 段"
+                    if not isinstance(segment, dict):
+                        errors.append(f"{segment_prefix}必须是对象")
+                        continue
+                    if segment.get("resolution") not in ("source", "keep", "pending"):
+                        errors.append(f"{segment_prefix}必须采用新源、保留旧依据或待定")
+                    if not isinstance(segment.get("bones"), list):
+                        errors.append(f"{segment_prefix}缺少骨骼列表")
+
     return errors
 
 
@@ -725,7 +775,11 @@ def _transform_differs(a: dict[str, float], b: dict[str, float], tolerance: floa
     )
 
 
-def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict[str, Any]]:
+def analyze_rebake(
+    project: dict[str, Any],
+    action: dict[str, Any],
+    variant_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Compare a baked action against the current source project.
 
     Returns affected segments in action-local time. Each segment lists the
@@ -738,14 +792,24 @@ def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict
     span = float(action["duration"])
     bones = [bone_id for bone_id in source.get("bones", []) if isinstance(bone_id, str)]
     count = int(round(span * fps)) + 1
+    if variant_id is not None:
+        variant = next(
+            (item for item in action.get("variants", []) or [] if item.get("id") == variant_id),
+            None,
+        )
+        if variant is None:
+            raise ValueError(f"找不到方案 {variant_id}")
+        compare_frames = variant.get("keyframes", [])
+    else:
+        compare_frames = action.get("keyframes", [])
     keyframe_by_index = {
-        int(round(float(frame["time"]) * fps)): frame for frame in action.get("keyframes", [])
+        int(round(float(frame["time"]) * fps)): frame for frame in compare_frames
     }
     cells: list[dict[str, Any]] = []
     for index in range(count):
         local_time = min(index / fps, span)
         source_pose = sample_local(project, range_start + local_time)
-        baked_pose = sample_frames(action["keyframes"], local_time)
+        baked_pose = sample_frames(compare_frames, local_time)
         differing = [
             bone_id for bone_id in bones
             if bone_id in source_pose and bone_id in baked_pose
@@ -782,6 +846,11 @@ def analyze_rebake(project: dict[str, Any], action: dict[str, Any]) -> list[dict
     active_decisions = [
         entry for entry in action.get("decision_log", []) or []
         if isinstance(entry, dict) and entry.get("status", "active") == "active"
+        and (
+            (entry.get("variant_id") == variant_id)
+            if variant_id is not None
+            else not entry.get("variant_id")
+        )
     ]
     for segment in segments:
         segment["basis"] = [
@@ -826,6 +895,7 @@ def apply_rebake(
     action_id: str,
     decisions: list[dict[str, Any]],
     variant_id: str | None = None,
+    batch_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply per-segment rebake decisions to one action; returns the new action.
 
@@ -841,8 +911,10 @@ def apply_rebake(
     With variant_id the decisions are applied to that draft variant's keyframes
     instead of the action itself, so two adoption plans for the same source
     revision stay independently editable until one is published. Without
-    variant_id the previous keyframes are snapshotted so older revisions remain
-    playable after save/reload.
+        variant_id the previous keyframes are snapshotted so older revisions remain
+        playable after save/reload. batch_id tags the decisions as belonging to a
+        review batch, so cancelling an unpublished batch decision can remove only
+        that batch's entries.
     """
     action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
     if action is None:
@@ -937,6 +1009,7 @@ def apply_rebake(
             },
             "resolution": decision["resolution"],
             "source_version": source_version,
+            "batch_id": batch_id,
             "status": "active",
             "created_at": _utc_now_iso(),
         })
@@ -1117,6 +1190,335 @@ def withdraw_decision(
     return updated
 
 
+def _get_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    batch = next(
+        (item for item in project.get("review_batches", []) or [] if item.get("id") == batch_id),
+        None,
+    )
+    if batch is None:
+        raise ValueError(f"找不到审阅批次 {batch_id}")
+    return batch
+
+
+def _get_batch_item(batch: dict[str, Any], action_id: str) -> dict[str, Any]:
+    item = next(
+        (entry for entry in batch.get("items", []) if entry.get("action_id") == action_id),
+        None,
+    )
+    if item is None:
+        raise ValueError(f"动作 {action_id} 不在审阅批次中")
+    return item
+
+
+def _segment_key(segment: dict[str, Any]) -> tuple[float, float, tuple[str, ...]]:
+    return (
+        round(float(segment.get("start", 0.0)), 9),
+        round(float(segment.get("end", 0.0)), 9),
+        tuple(sorted(segment.get("bones") or [])),
+    )
+
+
+def _refresh_batch_item(project: dict[str, Any], item: dict[str, Any]) -> None:
+    """Recompute affected segments for one open batch item; keep decisions/basis.
+
+    Segments already carrying an explicit decision keep it. Segments newly
+    introduced by a later source revision enter as "pending" together with the
+    earlier confirmed decisions (their basis) that intersect them.
+    """
+    action_id = item["action_id"]
+    variant_id = item.get("variant_id")
+    action = next(
+        (entry for entry in project.get("actions", []) or [] if entry.get("id") == action_id),
+        None,
+    )
+    if action is None:
+        item["segments"] = []
+        item["status"] = "missing"
+        return
+    fresh = analyze_rebake(project, action, variant_id)
+    prior: dict[Any, dict[str, Any]] = {
+        _segment_key(segment): segment
+        for segment in item.get("segments", [])
+        if isinstance(segment, dict) and segment.get("resolution") in ("source", "keep")
+    }
+    segments: list[dict[str, Any]] = []
+    seen_keys: set[Any] = set()
+    for segment in fresh:
+        key = _segment_key(segment)
+        seen_keys.add(key)
+        decided = prior.get(key)
+        segments.append({
+            "start": segment["start"],
+            "end": segment["end"],
+            "bones": list(segment["bones"]),
+            "manual": segment["manual"],
+            "basis": segment.get("basis", []),
+            "resolution": decided["resolution"] if decided is not None else "pending",
+            "resolved": False,
+        })
+    for key, decided in prior.items():
+        if key in seen_keys:
+            continue
+        segments.append({
+            "start": decided["start"],
+            "end": decided["end"],
+            "bones": list(decided.get("bones", [])),
+            "manual": decided.get("manual", False),
+            "basis": decided.get("basis", []),
+            "resolution": decided["resolution"],
+            "resolved": True,
+        })
+    segments.sort(key=lambda segment: (float(segment["start"]), float(segment["end"])))
+    item["segments"] = segments
+    explicit = [segment for segment in segments if segment["resolution"] in ("source", "keep")]
+    if explicit and all(segment["resolution"] in ("source", "keep") for segment in segments):
+        item["status"] = "decided"
+    else:
+        item["status"] = "open"
+
+
+def _refresh_batch(project: dict[str, Any], batch: dict[str, Any]) -> None:
+    for item in batch.get("items", []):
+        if item.get("status") != "published":
+            _refresh_batch_item(project, item)
+    if all(item.get("status") == "published" for item in batch.get("items", [])):
+        batch["status"] = "published"
+    elif any(item.get("status") == "published" for item in batch.get("items", [])):
+        batch["status"] = "partially_submitted"
+    else:
+        batch["status"] = "open"
+
+
+def review_batch_summary(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Return one batch with freshly recomputed pending segments (not persisted)."""
+    batch = deepcopy(_get_batch(project, batch_id))
+    _refresh_batch(project, batch)
+    return batch
+
+
+def create_review_batch(
+    project: dict[str, Any],
+    action_ids: list[str] | None = None,
+    batch_id: str | None = None,
+    name: str = "",
+) -> dict[str, Any]:
+    """Open one review batch covering every affected action of a source revision.
+
+    Each action gets its own draft variant so two actions sharing the same
+    source keep two independent drafts in the same batch. Nothing is published
+    until submit_review_batch; the batch (with pending items) is saved with the
+    project and can be resumed after reload.
+    """
+    updated = deepcopy(project)
+    batches = list(updated.get("review_batches", []) or [])
+    new_id = batch_id or f"batch-{len(batches) + 1}"
+    if any(item.get("id") == new_id for item in batches):
+        raise ValueError(f"审阅批次 id 重复：{new_id}")
+    candidates: list[dict[str, Any]] = []
+    requested = list(action_ids) if action_ids else None
+    for action in updated.get("actions", []) or []:
+        if requested is not None and action.get("id") not in requested:
+            continue
+        segments = analyze_rebake(updated, action)
+        if not segments:
+            if requested is not None and action.get("id") in requested:
+                raise ValueError(f"动作 {action.get('id')} 当前没有受源修订影响的区间")
+            continue
+        variants = action.setdefault("variants", [])
+        variant_index = len(variants) + 1
+        variant_id = f"{action['id']}-{new_id}-draft"
+        while any(item.get("id") == variant_id for item in variants):
+            variant_index += 1
+            variant_id = f"{action['id']}-{new_id}-draft-{variant_index}"
+        variants.append({
+            "id": variant_id,
+            "name": f"批次草稿 {variant_index}",
+            "status": "draft",
+            "keyframes": deepcopy(action.get("keyframes", [])),
+            "revision": 1,
+            "created_at": _utc_now_iso(),
+        })
+        candidates.append({
+            "action_id": action["id"],
+            "variant_id": variant_id,
+            "status": "open",
+            "source_version": int(updated.get("version", 1)),
+            "segments": [
+                {
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "bones": list(segment["bones"]),
+                    "manual": segment["manual"],
+                    "basis": segment.get("basis", []),
+                    "resolution": "pending",
+                }
+                for segment in segments
+            ],
+        })
+    if not candidates:
+        raise ValueError("没有受源修订影响的整理动作，无法创建审阅批次")
+    missing = sorted(set(requested or []) - {item["action_id"] for item in candidates})
+    if missing:
+        raise ValueError("以下动作不存在：" + "、".join(missing))
+    batch = {
+        "id": new_id,
+        "name": name or f"源 v{updated.get('version', 1)} 批次审阅",
+        "source_version": int(updated.get("version", 1)),
+        "status": "open",
+        "created_at": _utc_now_iso(),
+        "items": candidates,
+    }
+    batches.append(batch)
+    updated["review_batches"] = batches
+    return updated
+
+
+def set_review_item_decisions(
+    project: dict[str, Any],
+    batch_id: str,
+    action_id: str,
+    resolutions: dict[str, str] | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Record per-segment decisions for one batch item without publishing.
+
+    Explicit source/keep decisions are applied onto the item's private draft
+    variant; pending entries stay untouched. The batch and its bases are saved
+    with the project, so review can continue after reload or after the source is
+    revised again.
+    """
+    updated = deepcopy(project)
+    batch = _get_batch(updated, batch_id)
+    item = _get_batch_item(batch, action_id)
+    if item.get("status") == "published":
+        raise ValueError("该动作的批次决定已发布，不能再修改")
+    _refresh_batch_item(updated, item)
+    if isinstance(resolutions, dict):
+        choices = {
+            str(index): value
+            for index, value in resolutions.items()
+            if value in ("source", "keep", "pending")
+        }
+    else:
+        choices = {}
+        for entry in resolutions or []:
+            if not isinstance(entry, dict):
+                continue
+            index = entry.get("index")
+            value = entry.get("resolution")
+            if value in ("source", "keep", "pending") and index is not None:
+                choices[str(index)] = value
+    decisions: list[dict[str, Any]] = []
+    for index, segment in enumerate(item["segments"]):
+        resolution = choices.get(str(index), segment.get("resolution", "pending"))
+        segment["resolution"] = resolution
+        if resolution in ("source", "keep"):
+            decisions.append({
+                "segment": {
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "bones": segment["bones"],
+                },
+                "resolution": resolution,
+            })
+    item["status"] = "decided" if decisions and len(decisions) == len(item["segments"]) else "open"
+    if decisions:
+        # Rebase the draft from the action and replay every explicit decision
+        # recorded for this batch item, so editing one choice never duplicates
+        # an older application.
+        action = next(
+            (entry for entry in updated.get("actions", []) if entry.get("id") == action_id),
+            None,
+        )
+        variant_id = item.get("variant_id")
+        variant = next(
+            (entry for entry in (action or {}).get("variants", []) if entry.get("id") == variant_id),
+            None,
+        )
+        if action is None or variant is None:
+            raise ValueError("找不到该动作的批次草稿，无法记录决定")
+        variant["keyframes"] = deepcopy(action.get("keyframes", []))
+        variant["revision"] = 1
+        action["decision_log"] = [
+            entry for entry in (action.get("decision_log") or [])
+            if not (entry.get("batch_id") == batch_id and entry.get("variant_id") == variant_id)
+        ]
+        action = apply_rebake(updated, action_id, decisions, variant_id, batch_id=batch_id)
+        updated["actions"] = [
+            action if entry.get("id") == action_id else entry
+            for entry in updated.get("actions", [])
+        ]
+    _refresh_batch(updated, batch)
+    return updated
+
+
+def submit_review_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Publish only fully decided batch items; pending items remain saved.
+
+    Each decided item's private draft becomes that action's new revision.
+    Pending items (and their segments/bases) are preserved in the batch and can
+    be reviewed after reload or another source revision.
+    """
+    updated = deepcopy(project)
+    batch = _get_batch(updated, batch_id)
+    _refresh_batch(updated, batch)
+    decided_items = [
+        item for item in batch.get("items", [])
+        if item.get("status") != "published"
+        and item.get("segments")
+        and all(segment.get("resolution") in ("source", "keep") for segment in item["segments"])
+    ]
+    if not decided_items:
+        raise ValueError("本批还没有逐项明确决定的动作；未决定项会保存，稍后可继续")
+    for item in decided_items:
+        action_id = item["action_id"]
+        updated_action = publish_variant(updated, action_id, item["variant_id"])
+        updated["actions"] = [
+            updated_action if entry.get("id") == action_id else entry
+            for entry in updated.get("actions", [])
+        ]
+        item["status"] = "published"
+        item["published_at"] = _utc_now_iso()
+    _refresh_batch(updated, batch)
+    return updated
+
+
+def cancel_review_item(
+    project: dict[str, Any],
+    batch_id: str,
+    action_id: str,
+) -> dict[str, Any]:
+    """Cancel one item's unpublished batch decisions.
+
+    The item's private draft returns to its original keyframes and the batch's
+    decision entries are removed; the action itself and decisions published by
+    other batches (or directly) are never reverted.
+    """
+    updated = deepcopy(project)
+    batch = _get_batch(updated, batch_id)
+    item = _get_batch_item(batch, action_id)
+    if item.get("status") == "published":
+        raise ValueError("已发布的批次结果不能在此取消，请在动作内通过撤回决定处理")
+    action = next(
+        (entry for entry in updated.get("actions", []) if entry.get("id") == action_id),
+        None,
+    )
+    variant_id = item.get("variant_id")
+    if action is not None and variant_id:
+        for variant in action.get("variants", []) or []:
+            if variant.get("id") == variant_id:
+                variant["keyframes"] = deepcopy(action.get("keyframes", []))
+                variant["revision"] = 1
+        action["decision_log"] = [
+            entry for entry in (action.get("decision_log") or [])
+            if not (entry.get("batch_id") == batch_id and entry.get("variant_id") == variant_id)
+        ]
+    for segment in item.get("segments", []):
+        segment["resolution"] = "pending"
+    item["status"] = "open"
+    _refresh_batch(updated, batch)
+    return updated
+
+
 def sample_local(project: dict[str, Any], time: float) -> dict[str, dict[str, float]]:
     duration = float(project.get("duration", 0.0))
     clamped_time = min(max(float(time), 0.0), duration)
@@ -1189,6 +1591,7 @@ def migrate_project(project: dict[str, Any]) -> dict[str, Any]:
         return project
     project.setdefault("version", 1)
     project.setdefault("actions", [])
+    project.setdefault("review_batches", [])
     for layer in project.get("layers", []) or []:
         if isinstance(layer, dict):
             layer.setdefault("weight_keys", [])

@@ -40,6 +40,7 @@ export type DecisionRecord = {
   id: string;
   revision: number;
   variant_id?: string | null;
+  batch_id?: string | null;
   segment: { start: number; end: number; bones: string[] };
   resolution: "source" | "keep";
   source_version: number;
@@ -75,6 +76,32 @@ export type Project = {
   keyframes: Keyframe[];
   layers?: Layer[];
   actions?: Action[];
+  review_batches?: ReviewBatch[];
+};
+export type ReviewSegment = {
+  start: number;
+  end: number;
+  bones: string[];
+  manual: boolean;
+  basis?: DecisionBasis[];
+  resolution: "source" | "keep" | "pending";
+  resolved?: boolean;
+};
+export type ReviewItem = {
+  action_id: string;
+  variant_id: string;
+  status: "open" | "decided" | "published" | "missing";
+  source_version: number;
+  segments: ReviewSegment[];
+  published_at?: string;
+};
+export type ReviewBatch = {
+  id: string;
+  name?: string;
+  source_version: number;
+  status: "open" | "decided" | "partially_submitted" | "published";
+  created_at?: string;
+  items: ReviewItem[];
 };
 export type Clip = Pick<Project, "duration" | "keyframes"> & { layers?: Layer[] };
 
@@ -236,6 +263,28 @@ export function validateProject(project: Project): string[] {
       errors.push(...validateClipContent({ keyframes: variant.keyframes, layers: [] }, action.duration, bones, `${variantPrefix}内`));
     });
     errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`));
+  });
+  const batchIds = new Set<string>();
+  (project.review_batches ?? []).forEach((batch, batchIndex) => {
+    const prefix = `第 ${batchIndex + 1} 个审阅批次`;
+    if (!batch.id) errors.push(`${prefix}缺少有效 id`);
+    else if (batchIds.has(batch.id)) errors.push(`${prefix}id 重复：${batch.id}`);
+    else batchIds.add(batch.id);
+    if (!["open", "decided", "partially_submitted", "published"].includes(batch.status)) {
+      errors.push(`${prefix}的状态无效`);
+    }
+    if (batch.items.length === 0) errors.push(`${prefix}至少包含一个受影响动作`);
+    batch.items.forEach((item, itemIndex) => {
+      const itemPrefix = `${prefix}第 ${itemIndex + 1} 项`;
+      if (!actionIds.has(item.action_id)) errors.push(`${itemPrefix}引用了不存在的动作`);
+      if (!item.variant_id) errors.push(`${itemPrefix}缺少批次草稿 id`);
+      if (!["open", "decided", "published", "missing"].includes(item.status)) errors.push(`${itemPrefix}的状态无效`);
+      item.segments.forEach((segment, segmentIndex) => {
+        if (!["source", "keep", "pending"].includes(segment.resolution)) {
+          errors.push(`${itemPrefix}第 ${segmentIndex + 1} 段必须采用新源、保留旧依据或待定`);
+        }
+      });
+    });
   });
   return errors;
 }
@@ -481,6 +530,7 @@ export function migrateProject(project: Project): Project {
     if (!action.decision_log) action.decision_log = [];
     if (!action.variants) action.variants = [];
   });
+  if (!next.review_batches) next.review_batches = [];
   return next;
 }
 
@@ -506,16 +556,21 @@ const transformDiffers = (a: Transform, b: Transform, tolerance = 1e-7) =>
   || Math.abs(a.y - b.y) > tolerance
   || Math.abs(shortestAngleDelta(b.rotation, a.rotation)) > tolerance;
 
-export function analyzeRebake(project: Project, action: Action): RebakeSegment[] {
+export function analyzeRebake(project: Project, action: Action, variantId?: string | null): RebakeSegment[] {
   const { fps, range_start: rangeStart, bones } = action.source;
   const span = action.duration;
   const count = Math.round(span * fps) + 1;
-  const keyframeByIndex = new Map(action.keyframes.map((frame) => [Math.round(frame.time * fps), frame]));
+  const variant = variantId == null
+    ? null
+    : action.variants?.find((item) => item.id === variantId) ?? null;
+  if (variantId != null && !variant) throw new Error(`找不到方案 ${variantId}`);
+  const compareFrames = variant ? variant.keyframes : action.keyframes;
+  const keyframeByIndex = new Map(compareFrames.map((frame) => [Math.round(frame.time * fps), frame]));
   const cells: { index: number; time: number; bones: string[]; manual: boolean }[] = [];
   for (let index = 0; index < count; index += 1) {
     const localTime = Math.min(index / fps, span);
     const sourcePose = sampleLocal(project, rangeStart + localTime);
-    const bakedPose = sampleFrames(action.keyframes, localTime);
+    const bakedPose = sampleFrames(compareFrames, localTime);
     const differing = bones.filter((boneId) => sourcePose[boneId] && bakedPose[boneId]
       && transformDiffers(sourcePose[boneId], bakedPose[boneId]));
     if (differing.length === 0) continue;
@@ -532,7 +587,8 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
       segments.push({ lastIndex: cell.index, start: cell.time, end: cell.time, bones: [...cell.bones], manual: cell.manual });
     }
   });
-  const activeDecisions = (action.decision_log ?? []).filter((entry) => (entry.status ?? "active") === "active");
+  const activeDecisions = (action.decision_log ?? []).filter((entry) => (entry.status ?? "active") === "active"
+    && (variantId == null ? !entry.variant_id : entry.variant_id === variantId));
   return segments.map(({ start, end, bones: segmentBones, manual }) => ({
     start,
     end,
@@ -552,7 +608,7 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
 
 export type RebakeDecision = { segment: { start: number; end: number; bones?: string[] }; resolution: "source" | "keep" };
 
-export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[], variantId?: string | null): Project {
+export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[], variantId?: string | null, batchId?: string | null): Project {
   const action = project.actions?.find((item) => item.id === actionId);
   if (!action) throw new Error(`找不到整理动作 ${actionId}`);
   const confirmed = decisions.filter((decision) => decision.resolution === "source" || decision.resolution === "keep");
@@ -597,6 +653,7 @@ export function applyRebake(project: Project, actionId: string, decisions: Rebak
     id: `${actionId}-d${(action.decision_log ?? []).length + index + 1}`,
     revision,
     variant_id: variantId ?? null,
+    batch_id: batchId ?? null,
     segment: {
       start: decision.segment.start,
       end: decision.segment.end,
@@ -742,6 +799,211 @@ export type ContinuityReport = {
   maxOutsideDelta: number;
   boundaries: { time: number; delta: number }[];
 };
+
+const segmentKey = (segment: { start: number; end: number; bones?: string[] }) =>
+  [segment.start, segment.end, [...(segment.bones ?? [])].sort().join(",")].join("|");
+
+const refreshBatchItem = (project: Project, item: ReviewItem) => {
+  const action = project.actions?.find((entry) => entry.id === item.action_id);
+  if (!action) {
+    item.segments = [];
+    item.status = "missing";
+    return;
+  }
+  const fresh = analyzeRebake(project, action, item.variant_id);
+  const prior = new Map(
+    item.segments
+      .filter((segment) => segment.resolution === "source" || segment.resolution === "keep")
+      .map((segment) => [segmentKey(segment), segment]),
+  );
+  const seen = new Set<string>();
+  const segments: ReviewSegment[] = fresh.map((segment) => {
+    const key = segmentKey(segment);
+    seen.add(key);
+    const decided = prior.get(key);
+    return { ...segment, basis: segment.basis, resolution: decided?.resolution ?? "pending", resolved: false };
+  });
+  prior.forEach((decided, key) => {
+    if (!seen.has(key)) {
+      segments.push({
+        start: decided.start, end: decided.end, bones: decided.bones, manual: decided.manual,
+        basis: decided.basis, resolution: decided.resolution, resolved: true,
+      });
+    }
+  });
+  segments.sort((a, b) => a.start - b.start || a.end - b.end);
+  item.segments = segments;
+  item.status = segments.length > 0 && segments.every((segment) => segment.resolution !== "pending")
+    ? "decided"
+    : "open";
+};
+
+const refreshBatch = (project: Project, batch: ReviewBatch) => {
+  batch.items.forEach((item) => {
+    if (item.status !== "published") refreshBatchItem(project, item);
+  });
+  batch.status = batch.items.every((item) => item.status === "published")
+    ? "published"
+    : batch.items.some((item) => item.status === "published")
+      ? "partially_submitted"
+      : "open";
+};
+
+export function reviewBatchSummary(project: Project, batchId: string): ReviewBatch {
+  const batch = project.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error(`找不到审阅批次 ${batchId}`);
+  const copy = structuredClone(batch);
+  refreshBatch(project, copy);
+  return copy;
+}
+
+export function createReviewBatch(project: Project, actionIds?: string[], batchId?: string, name = ""): Project {
+  const next = cloneProject(project);
+  const batches = [...(next.review_batches ?? [])];
+  const id = batchId ?? `batch-${batches.length + 1}`;
+  if (batches.some((item) => item.id === id)) throw new Error(`审阅批次 id 重复：${id}`);
+  const items: ReviewItem[] = [];
+  (next.actions ?? []).forEach((action) => {
+    if (actionIds && !actionIds.includes(action.id)) return;
+    const segments = analyzeRebake(next, action);
+    if (segments.length === 0) {
+      if (actionIds?.includes(action.id)) throw new Error(`动作 ${action.id} 当前没有受源修订影响的区间`);
+      return;
+    }
+    const variants = action.variants ?? [];
+    let variantIndex = variants.length + 1;
+    let variantId = `${action.id}-${id}-draft`;
+    while (variants.some((item) => item.id === variantId)) {
+      variantIndex += 1;
+      variantId = `${action.id}-${id}-draft-${variantIndex}`;
+    }
+    variants.push({
+      id: variantId,
+      name: `批次草稿 ${variantIndex}`,
+      status: "draft",
+      keyframes: structuredClone(action.keyframes),
+      revision: 1,
+      created_at: new Date().toISOString(),
+    });
+    action.variants = variants;
+    items.push({
+      action_id: action.id,
+      variant_id: variantId,
+      status: "open",
+      source_version: next.version,
+      segments: segments.map((segment) => ({
+        start: segment.start, end: segment.end, bones: segment.bones,
+        manual: segment.manual, basis: segment.basis, resolution: "pending" as const,
+      })),
+    });
+  });
+  if (actionIds) {
+    const known = new Set((next.actions ?? []).map((action) => action.id));
+    const missing = actionIds.filter((actionId) => !known.has(actionId));
+    if (missing.length) throw new Error(`以下动作不存在：${missing.join("、")}`);
+  }
+  if (items.length === 0) throw new Error("没有受源修订影响的整理动作，无法创建审阅批次");
+  batches.push({
+    id,
+    name: name || `源 v${next.version} 批次审阅`,
+    source_version: next.version,
+    status: "open",
+    created_at: new Date().toISOString(),
+    items,
+  });
+  next.review_batches = batches;
+  return next;
+}
+
+export function setReviewItemDecisions(
+  project: Project,
+  batchId: string,
+  actionId: string,
+  resolutions: Record<number, "source" | "keep" | "pending"> | ReviewSegment[],
+): Project {
+  const next = cloneProject(project);
+  const batch = next.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error(`找不到审阅批次 ${batchId}`);
+  const item = batch.items.find((entry) => entry.action_id === actionId);
+  if (!item) throw new Error(`动作 ${actionId} 不在审阅批次中`);
+  if (item.status === "published") throw new Error("该动作的批次决定已发布，不能再修改");
+  refreshBatchItem(next, item);
+  const choiceOf = (index: number): "source" | "keep" | "pending" => {
+    if (Array.isArray(resolutions)) {
+      const found = resolutions[index];
+      return found?.resolution ?? item.segments[index].resolution;
+    }
+    return resolutions[index] ?? item.segments[index].resolution;
+  };
+  const decisions: RebakeDecision[] = [];
+  item.segments.forEach((segment, index) => {
+    segment.resolution = choiceOf(index);
+    if (segment.resolution !== "pending") {
+      decisions.push({
+        segment: { start: segment.start, end: segment.end, bones: segment.bones },
+        resolution: segment.resolution,
+      });
+    }
+  });
+  item.status = decisions.length > 0 && decisions.length === item.segments.length ? "decided" : "open";
+  if (decisions.length > 0) {
+    const action = next.actions?.find((entry) => entry.id === actionId);
+    const variant = action?.variants?.find((entry) => entry.id === item.variant_id);
+    if (!action || !variant) throw new Error("找不到该动作的批次草稿，无法记录决定");
+    variant.keyframes = structuredClone(action.keyframes);
+    variant.revision = 1;
+    action.decision_log = (action.decision_log ?? [])
+      .filter((entry) => !(entry.batch_id === batchId && entry.variant_id === item.variant_id));
+    let applied = applyRebake(next, actionId, decisions, item.variant_id, batchId);
+    next.actions = applied.actions;
+  }
+  refreshBatch(next, batch);
+  return next;
+}
+
+export function submitReviewBatch(project: Project, batchId: string): Project {
+  const next = cloneProject(project);
+  const batch = next.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error(`找不到审阅批次 ${batchId}`);
+  refreshBatch(next, batch);
+  const decidedItems = batch.items.filter((item) => item.status !== "published"
+    && item.segments.length > 0
+    && item.segments.every((segment) => segment.resolution !== "pending"));
+  if (decidedItems.length === 0) {
+    throw new Error("本批还没有逐项明确决定的动作；未决定项会保存，稍后可继续");
+  }
+  decidedItems.forEach((item) => {
+    let applied = publishVariant(next, item.action_id, item.variant_id);
+    next.actions = applied.actions;
+    item.status = "published";
+    item.published_at = new Date().toISOString();
+  });
+  refreshBatch(next, batch);
+  return next;
+}
+
+export function cancelReviewItem(project: Project, batchId: string, actionId: string): Project {
+  const next = cloneProject(project);
+  const batch = next.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error(`找不到审阅批次 ${batchId}`);
+  const item = batch.items.find((entry) => entry.action_id === actionId);
+  if (!item) throw new Error(`动作 ${actionId} 不在审阅批次中`);
+  if (item.status === "published") throw new Error("已发布的批次结果不能在此取消，请在动作内通过撤回决定处理");
+  const action = next.actions?.find((entry) => entry.id === actionId);
+  if (action) {
+    const draft = action.variants?.find((variant) => variant.id === item.variant_id);
+    if (draft) {
+      draft.keyframes = structuredClone(action.keyframes);
+      draft.revision = 1;
+    }
+    action.decision_log = (action.decision_log ?? [])
+      .filter((entry) => !(entry.batch_id === batchId && entry.variant_id === item.variant_id));
+  }
+  item.segments.forEach((segment) => { segment.resolution = "pending"; });
+  item.status = "open";
+  refreshBatch(next, batch);
+  return next;
+}
 
 const poseDelta = (a: Record<string, Transform>, b: Record<string, Transform>, bones: string[]) =>
   Math.max(...bones.map((boneId) => {

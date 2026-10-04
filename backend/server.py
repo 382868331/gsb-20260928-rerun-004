@@ -12,13 +12,18 @@ from animation_core import (
     apply_rebake,
     bake_action,
     create_variant,
+    cancel_review_item,
+    create_review_batch,
     default_project,
     evaluate_world,
     export_action,
     load_project,
     publish_variant,
+    review_batch_summary,
     sample_local,
     save_project,
+    set_review_item_decisions,
+    submit_review_batch,
     validate_project,
     withdraw_decision,
     withdrawal_preview,
@@ -113,6 +118,7 @@ class AnimationHandler(BaseHTTPRequestHandler):
                             action_id,
                             list(payload.get("decisions", [])),
                             payload.get("variant_id"),
+                            payload.get("batch_id"),
                         )
                         self.end_json({"ok": True, "action": updated})
                     else:
@@ -149,6 +155,45 @@ class AnimationHandler(BaseHTTPRequestHandler):
                     else:
                         self.end_json({"ok": True, "preview": withdrawal_preview(project, action_id, decision_id)})
                 except (KeyError, TypeError, ValueError) as exc:
+                    self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/review-batch":
+                try:
+                    project = payload["project"]
+                    op = str(payload.get("op", "create"))
+                    if op == "create":
+                        action_ids = payload.get("action_ids")
+                        updated = create_review_batch(
+                            project,
+                            [str(item) for item in action_ids] if isinstance(action_ids, list) else None,
+                            payload.get("batch_id"),
+                            str(payload.get("name", "")),
+                        )
+                        self.end_json({"ok": True, "project": updated, "batch": updated.get("review_batches", [])[-1]})
+                    elif op == "get":
+                        self.end_json({
+                            "ok": True,
+                            "batch": review_batch_summary(project, str(payload["batch_id"])),
+                        })
+                    elif op == "decide":
+                        updated = set_review_item_decisions(
+                            project,
+                            str(payload["batch_id"]),
+                            str(payload["action_id"]),
+                            payload.get("resolutions", {}),
+                        )
+                        self.end_json({"ok": True, "project": updated})
+                    elif op == "submit":
+                        updated = submit_review_batch(project, str(payload["batch_id"]))
+                        self.end_json({"ok": True, "project": updated})
+                    elif op == "cancel-item":
+                        updated = cancel_review_item(
+                            project, str(payload["batch_id"]), str(payload["action_id"]),
+                        )
+                        self.end_json({"ok": True, "project": updated})
+                    else:
+                        self.end_json({"errors": [f"未知批次操作 {op}"]}, HTTPStatus.BAD_REQUEST)
+                except (KeyError, TypeError, ValueError, IndexError) as exc:
                     self.end_json({"errors": [str(exc)]}, HTTPStatus.BAD_REQUEST)
                 return
             if parsed.path != "/api/project":

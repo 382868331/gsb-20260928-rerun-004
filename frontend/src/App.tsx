@@ -31,8 +31,18 @@ import {
   type Action,
   type ActionVariant,
   type Project,
+  type ReviewBatch,
+  type ReviewItem,
+  type ReviewSegment,
   type Transform,
   type WithdrawalPreview,
+} from "./animation";
+import {
+  cancelReviewItem,
+  createReviewBatch,
+  reviewBatchSummary,
+  setReviewItemDecisions,
+  submitReviewBatch,
 } from "./animation";
 import { defaultProject } from "./defaultProject";
 import { SkeletonCanvas } from "./SkeletonCanvas";
@@ -118,6 +128,77 @@ function ComparePanel({ project, action, time, previewRevision }: {
   </div>;
 }
 
+function BatchReviewPanel({ batch, project, onDecide, onSubmit, onCancelItem, onOpenAction }: {
+  batch: ReviewBatch;
+  project: Project;
+  onDecide: (item: ReviewItem, resolutions: Record<number, ReviewSegment["resolution"]>) => void;
+  onSubmit: () => void;
+  onCancelItem: (item: ReviewItem) => void;
+  onOpenAction: (actionId: string) => void;
+}) {
+  const decidedCount = batch.items.filter((item) => item.status === "decided" || item.status === "published").length;
+  const pendingItems = batch.items.filter((item) => item.status !== "published");
+  return <div className="batch-panel">
+    <div className="card-title">
+      <h3>{batch.name ?? batch.id}（源 v{batch.source_version}）</h3>
+      <span>已明确 {decidedCount}/{batch.items.length} 项；提交只发布决定完整的动作，未决定项及依据继续保存</span>
+    </div>
+    {batch.items.map((item) => {
+      const action = project.actions?.find((entry) => entry.id === item.action_id);
+      const pending = item.segments.filter((segment) => segment.resolution === "pending");
+      return <div key={item.action_id} className={item.status === "published" ? "batch-item published" : "batch-item"}>
+        <div className="batch-item-head">
+          <strong>{action?.name ?? item.action_id}</strong>
+          <span className="hint">
+            草稿 {item.variant_id} · 
+            {item.status === "published" && "已发布"}
+            {item.status === "decided" && "逐项已决定，待提交"}
+            {item.status === "open" && `${pending.length} 项待定`}
+          </span>
+          <button onClick={() => onOpenAction(item.action_id)}>打开动作</button>
+          {item.status !== "published" && <>
+            <button onClick={() => onDecide(item, Object.fromEntries(item.segments.map((_, index) => [index, "source" as const])))}>
+              全部采用新源
+            </button>
+            <button onClick={() => onCancelItem(item)}>取消未发布决定</button>
+          </>}
+        </div>
+        {item.status !== "published" && item.segments.map((segment, index) => <div key={index} className="batch-segment">
+          <label>
+            {segment.start.toFixed(2)}~{segment.end.toFixed(2)}s · {segment.bones.join("、")}
+            {segment.resolved && <em>（已应用，不再与源有差异）</em>}
+          </label>
+          {segment.basis && segment.basis.length > 0 && <span className="basis">
+            依据：{segment.basis.map((entry) =>
+              `${entry.id}（${entry.resolution === "keep" ? "保留手工" : "采用源"}·v${entry.source_version ?? "?"}）`,
+            ).join("、")}
+          </span>}
+          <span className="rebake-choice">
+            {["source", "keep", "pending"].map((value) => <label key={value}>
+              <input type="radio"
+                name={`${item.action_id}-${batch.id}-${index}`}
+                checked={segment.resolution === value}
+                onChange={() => onDecide(item, Object.fromEntries(item.segments.map((current, currentIndex) => [
+                  currentIndex,
+                  currentIndex === index
+                    ? value as ReviewSegment["resolution"]
+                    : current.resolution,
+                ])))} />
+              {value === "source" ? "采用新源" : value === "keep" ? "保留旧依据" : "继续待定"}
+            </label>)}
+          </span>
+        </div>)}
+      </div>;
+    })}
+    <div className="batch-actions">
+      <button className="primary bake-btn" onClick={onSubmit} disabled={!batch.items.some((item) => item.status === "decided")}>
+        提交批次（只发布明确决定项）
+      </button>
+      {pendingItems.length > 0 && <span className="hint">{pendingItems.length} 个动作仍有待定项，提交后保留在本批中，保存重开或源再次修订后可继续。</span>}
+    </div>
+  </div>;
+}
+
 export default function App() {
   const [project, setProject] = useState<Project>(defaultProject);
   const [history, setHistory] = useState<Project[]>([]);
@@ -138,6 +219,7 @@ export default function App() {
   const [previewRevision, setPreviewRevision] = useState<number | null>(null);
   const [selectedVariantId, setSelectedVariantId] = useState<string | null>(null);
   const [withdrawPreview, setWithdrawPreview] = useState<WithdrawalPreview | null>(null);
+  const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -201,6 +283,15 @@ export default function App() {
         .map((action) => action.id),
     );
   }, [project.actions]);
+
+  const reviewBatches = useMemo(
+    () => (project.review_batches ?? []).map((batch) => reviewBatchSummary(project, batch.id)),
+    [project],
+  );
+  const activeBatch = useMemo<ReviewBatch | null>(
+    () => reviewBatches.find((batch) => batch.id === activeBatchId) ?? null,
+    [reviewBatches, activeBatchId],
+  );
 
   const frames = useMemo(() => orderedKeyframes(viewProject), [viewProject]);
   const editingFrame = useMemo(() => nearestEditableFrame(viewProject, time), [viewProject, time]);
@@ -524,6 +615,112 @@ export default function App() {
     }
   };
 
+  const applyBatchProject = async (next: Project) => {
+    if (validateProject(next).length > 0) {
+      setMessage("批次结果未通过校验，已放弃（工程未修改）。");
+      return null;
+    }
+    setHistory((items) => [...items.slice(-49), project]);
+    setProject(next);
+    return next;
+  };
+
+  const runCreateBatch = async () => {
+    try {
+      let next = createReviewBatch(project);
+      const batch = next.review_batches?.at(-1) ?? null;
+      try {
+        const verified = await api<{ project: Project }>("/api/review-batch", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "create" }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地批次；保存前请启动后端核对。");
+      }
+      if ((await applyBatchProject(next)) && batch) {
+        setActiveBatchId(batch.id);
+        setReport({ ok: true, message: `已开启批次「${batch.name ?? batch.id}」：${batch.items.length} 个受影响动作各自保留独立草稿，可逐项采用新源、保留旧依据或继续待定。` });
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "开启批次审阅失败");
+    }
+  };
+
+  const runBatchDecide = async (item: ReviewItem, resolutions: Record<number, ReviewSegment["resolution"]>) => {
+    if (!activeBatch) return;
+    try {
+      let next = setReviewItemDecisions(project, activeBatch.id, item.action_id, resolutions);
+      try {
+        const verified = await api<{ project: Project }>("/api/review-batch", {
+          method: "POST",
+          body: JSON.stringify({
+            project, op: "decide", batch_id: activeBatch.id, action_id: item.action_id,
+            resolutions: Object.fromEntries(Object.entries(resolutions).map(([index, value]) => [index, value])),
+          }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地批次决定；保存前请启动后端核对。");
+      }
+      if (await applyBatchProject(next)) {
+        setMessage(`已记录「${item.action_id}」的逐项决定到草稿；未决定项继续保留，提交前不会发布。`);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "记录批次决定失败");
+    }
+  };
+
+  const runBatchSubmit = async () => {
+    if (!activeBatch) return;
+    try {
+      let next = submitReviewBatch(project, activeBatch.id);
+      try {
+        const verified = await api<{ project: Project }>("/api/review-batch", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "submit", batch_id: activeBatch.id }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地批次提交；保存前请启动后端核对。");
+      }
+      const batchAfter = next.review_batches?.find((item) => item.id === activeBatch.id) ?? null;
+      const publishedCount = batchAfter?.items.filter((item) => item.status === "published").length ?? 0;
+      const pendingCount = batchAfter?.items.filter((item) => item.status !== "published").length ?? 0;
+      if (await applyBatchProject(next)) {
+        setReport({
+          ok: true,
+          message: pendingCount > 0
+            ? `本批已发布 ${publishedCount} 个明确决定的动作；${pendingCount} 个未决定动作及其依据已保存，可稍后继续。`
+            : `本批 ${publishedCount} 个动作的决定已全部发布。`,
+        });
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "提交批次失败");
+    }
+  };
+
+  const runBatchCancelItem = async (item: ReviewItem) => {
+    if (!activeBatch) return;
+    try {
+      let next = cancelReviewItem(project, activeBatch.id, item.action_id);
+      try {
+        const verified = await api<{ project: Project }>("/api/review-batch", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "cancel-item", batch_id: activeBatch.id, action_id: item.action_id }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地取消结果；保存前请启动后端核对。");
+      }
+      if (await applyBatchProject(next)) {
+        setReport({ ok: true, message: `已取消「${item.action_id}」未发布的批次决定：草稿恢复原状；其他批次已发布结果不受影响。` });
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "取消批次决定失败");
+    }
+  };
+
   return (
     <main className="app-shell">
       <header>
@@ -623,16 +820,42 @@ export default function App() {
             {action.name}（源 v{action.source.source_version} · r{action.revision ?? 1}）
           </button>)}
         </div>
-        {!activeAction && affectedActions.length > 0 && <div className="shared-panel">
-          <strong>源工程 v{project.version} 更新后，{affectedActions.length} 个整理动作受影响（各自独立决定，不会因源相同而强制同步）：</strong>
-          {affectedActions.map(({ action, segments }) => <div key={action.id} className="shared-row">
-            <span>
-              {action.name}：{segments.length} 个受影响区间
-              {sharedSourceKeys.has(action.id) && <em>（与其他动作共享同一段源动作）</em>}
-            </span>
-            <button onClick={() => switchAction(action.id)}>逐段查看并决定</button>
-          </div>)}
-        </div>}
+       {!activeAction && affectedActions.length > 0 && <div className="shared-panel">
+         <strong>源工程 v{project.version} 更新后，{affectedActions.length} 个整理动作受影响（各自独立决定，不会因源相同而强制同步）：</strong>
+         {affectedActions.map(({ action, segments }) => <div key={action.id} className="shared-row">
+           <span>
+             {action.name}：{segments.length} 个受影响区间
+             {sharedSourceKeys.has(action.id) && <em>（与其他动作共享同一段源动作）</em>}
+           </span>
+           <button onClick={() => switchAction(action.id)}>逐段查看并决定</button>
+         </div>)}
+       </div>}
+        {!activeAction && <>
+          {affectedActions.length > 0 && <div className="batch-bar">
+            <button className="primary" onClick={runCreateBatch}>把 {affectedActions.length} 个受影响动作放入同一批次审阅</button>
+            <span className="hint">每个动作在批次中保留各自草稿：逐项采用新源、保留旧依据或继续待定；保存重开后可继续。</span>
+          </div>}
+          {reviewBatches.length > 0 && <div className="batch-list">
+            <div className="card-title"><h3>审阅批次</h3><span>未提交的待定项随工程保存；提交只发布明确决定的动作</span></div>
+            {reviewBatches.map((batch) => {
+              const openCount = batch.items.filter((item) => item.status !== "published").length;
+              const decidedCount = batch.items.filter((item) => item.status === "decided").length;
+              return <div key={batch.id} className={activeBatchId === batch.id ? "batch-row active" : "batch-row"}>
+                <button className="chip" onClick={() => setActiveBatchId(activeBatchId === batch.id ? null : batch.id)}>
+                  {batch.name ?? batch.id}（{batch.items.length - openCount}/{batch.items.length} 已发布{decidedCount > 0 ? `，${decidedCount} 项待提交` : ""}）
+                </button>
+                {activeBatchId === batch.id && <BatchReviewPanel
+                  batch={batch}
+                  project={project}
+                  onDecide={runBatchDecide}
+                  onSubmit={runBatchSubmit}
+                  onCancelItem={runBatchCancelItem}
+                  onOpenAction={(actionId) => switchAction(actionId)}
+                />}
+              </div>;
+            })}
+          </div>}
+        </>}
         {activeAction && <>
           <div className="provenance hint">
             <strong>{activeAction.name}</strong>：整理自源工程版本 v{activeAction.source.source_version}（当前源 v{project.version}），
