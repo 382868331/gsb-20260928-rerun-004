@@ -7,7 +7,9 @@ import {
   addWeightKey,
   addLayerKeyframe,
   bakeAction,
+  cancelReviewDecision,
   continuityReport,
+  createReviewBatch,
   createVariant,
   duplicateKeyframe,
   exportAction,
@@ -15,7 +17,9 @@ import {
   moveKeyframe,
   orderedKeyframes,
   publishVariant,
+  refreshReviewBatch,
   removeWeightKey,
+  saveReviewBatch,
   sampleFrames,
   updateWeightKey,
   updateLayer,
@@ -26,11 +30,13 @@ import {
   weightKeyMultiplier,
   sampleLocal,
   shortestAngleDelta,
+  submitReviewBatch,
   withdrawDecision,
   withdrawalPreview,
   type Action,
   type ActionVariant,
   type Project,
+  type ReviewDecision,
   type Transform,
   type WithdrawalPreview,
 } from "./animation";
@@ -138,6 +144,7 @@ export default function App() {
   const [previewRevision, setPreviewRevision] = useState<number | null>(null);
   const [selectedVariantId, setSelectedVariantId] = useState<string | null>(null);
   const [withdrawPreview, setWithdrawPreview] = useState<WithdrawalPreview | null>(null);
+  const [batchChoices, setBatchChoices] = useState<Record<string, ReviewDecision["resolution"]>>({});
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -201,6 +208,10 @@ export default function App() {
         .map((action) => action.id),
     );
   }, [project.actions]);
+  const openBatch = useMemo(
+    () => [...(project.review_batches ?? [])].reverse().find((batch) => batch.status === "open") ?? null,
+    [project.review_batches],
+  );
 
   const frames = useMemo(() => orderedKeyframes(viewProject), [viewProject]);
   const editingFrame = useMemo(() => nearestEditableFrame(viewProject, time), [viewProject, time]);
@@ -524,6 +535,80 @@ export default function App() {
     }
   };
 
+  const batchChoiceKey = (batchId: string, actionId: string, index: number) => `${batchId}/${actionId}/${index}`;
+
+  const currentBatchChoices = () => {
+    if (!openBatch) return {};
+    return Object.fromEntries(openBatch.items.map((item) => [
+      item.action_id,
+      item.decisions.map((decision, index) => batchChoices[batchChoiceKey(openBatch.id, item.action_id, index)] ?? decision.resolution),
+    ]));
+  };
+
+  const runCreateReviewBatch = () => {
+    try {
+      const next = createReviewBatch(project);
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setBatchChoices({});
+      setMessage("已创建源修订审阅批次：所有受影响动作在同一批次中逐项决定，保存后可继续。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "创建审阅批次失败");
+    }
+  };
+
+  const runSaveReviewBatch = () => {
+    if (!openBatch) return;
+    try {
+      const next = saveReviewBatch(project, openBatch.id, currentBatchChoices());
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setMessage("批次草稿已保存：仅记录决定，不发布任何动作；关闭重开后可继续。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存批次失败");
+    }
+  };
+
+  const runRefreshReviewBatch = () => {
+    if (!openBatch) return;
+    try {
+      const next = refreshReviewBatch(project, openBatch.id);
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setMessage("已按最新源修订刷新批次：已发布依据保留，新的待定区间已加入。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "刷新批次失败");
+    }
+  };
+
+  const runSubmitReviewItem = (actionId: string) => {
+    if (!openBatch) return;
+    try {
+      const next = submitReviewBatch(project, openBatch.id, currentBatchChoices(), [actionId]);
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setMessage(`已提交「${actionId}」的明确决定；待定项和其他动作草稿继续保留。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "提交审阅项失败");
+    }
+  };
+
+  const runCancelReviewDecision = (actionId: string, index: number) => {
+    if (!openBatch) return;
+    const item = openBatch.items.find((entry) => entry.action_id === actionId);
+    const decision = item?.decisions[index];
+    if (!decision) return;
+    try {
+      const next = cancelReviewDecision(project, openBatch.id, actionId, decision.segment);
+      setHistory((items) => [...items.slice(-49), project]);
+      setProject(next);
+      setBatchChoices((items) => ({ ...items, [batchChoiceKey(openBatch.id, actionId, index)]: "pending" }));
+      setMessage("已取消该未发布决定；其他批次和已发布修订不受影响。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "取消未发布决定失败");
+    }
+  };
+
   return (
     <main className="app-shell">
       <header>
@@ -632,6 +717,42 @@ export default function App() {
             </span>
             <button onClick={() => switchAction(action.id)}>逐段查看并决定</button>
           </div>)}
+          {!openBatch && <button className="primary" onClick={runCreateReviewBatch}>将所有受影响动作加入同一审阅批次</button>}
+        </div>}
+        {!activeAction && openBatch && <div className="shared-panel">
+          <div className="card-title">
+            <h3>源修订批次 {openBatch.id}（v{openBatch.source_version}）</h3>
+            <span>可逐项采用新源、保留旧依据或继续待定；保存不发布，提交只发布明确决定的动作。</span>
+          </div>
+          {openBatch.items.map((item) => {
+            const action = project.actions?.find((entry) => entry.id === item.action_id);
+            return <div key={item.id} className="rebake-panel">
+              <div className="shared-row">
+                <strong>{action?.name ?? item.action_id}（{item.status}）</strong>
+                <button onClick={() => runSubmitReviewItem(item.action_id)}>提交本动作的明确决定</button>
+              </div>
+              {item.decisions.map((decision, index) => {
+                const key = batchChoiceKey(openBatch.id, item.action_id, index);
+                const published = decision.status === "published";
+                return <div key={key} className="rebake-row">
+                  <span>{decision.segment.start.toFixed(2)}~{decision.segment.end.toFixed(2)}s · {decision.segment.bones.join("、")}</span>
+                  {published ? <span>已发布：{decision.published_id}</span> : <>
+                    <label><input type="radio" name={key} value="pending" checked={(batchChoices[key] ?? decision.resolution) === "pending"}
+                      onChange={() => setBatchChoices((items) => ({ ...items, [key]: "pending" }))} />待定</label>
+                    <label><input type="radio" name={key} value="source" checked={(batchChoices[key] ?? decision.resolution) === "source"}
+                      onChange={() => setBatchChoices((items) => ({ ...items, [key]: "source" }))} />采用新源</label>
+                    <label><input type="radio" name={key} value="keep" checked={(batchChoices[key] ?? decision.resolution) === "keep"}
+                      onChange={() => setBatchChoices((items) => ({ ...items, [key]: "keep" }))} />保留旧依据</label>
+                    <button onClick={() => runCancelReviewDecision(item.action_id, index)}>取消未发布决定</button>
+                  </>}
+                </div>;
+              })}
+            </div>;
+          })}
+          <div className="variant-bar">
+            <button className="primary" onClick={runSaveReviewBatch}>保存批次草稿</button>
+            <button onClick={runRefreshReviewBatch}>按最新源修订刷新</button>
+          </div>
         </div>}
         {activeAction && <>
           <div className="provenance hint">

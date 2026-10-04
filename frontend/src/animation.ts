@@ -67,6 +67,31 @@ export type Action = {
   variants?: ActionVariant[];
   source: BakedSource;
 };
+export type ReviewDecision = {
+  segment: { start: number; end: number; bones: string[] };
+  resolution: "source" | "keep" | "pending";
+  status?: "draft" | "published" | "canceled";
+  basis?: DecisionBasis[];
+  source_version?: number;
+  published_id?: string;
+  published_at?: string;
+  canceled_at?: string;
+  saved_at?: string;
+};
+export type ReviewItem = {
+  id: string;
+  action_id: string;
+  status: "pending" | "submitted" | "completed";
+  decisions: ReviewDecision[];
+};
+export type ReviewBatch = {
+  id: string;
+  source_version: number;
+  status: "open" | "completed";
+  created_at?: string;
+  completed_at?: string;
+  items: ReviewItem[];
+};
 export type Project = {
   name: string;
   version: number;
@@ -75,6 +100,7 @@ export type Project = {
   keyframes: Keyframe[];
   layers?: Layer[];
   actions?: Action[];
+  review_batches?: ReviewBatch[];
 };
 export type Clip = Pick<Project, "duration" | "keyframes"> & { layers?: Layer[] };
 
@@ -481,6 +507,7 @@ export function migrateProject(project: Project): Project {
     if (!action.decision_log) action.decision_log = [];
     if (!action.variants) action.variants = [];
   });
+  if (!next.review_batches) next.review_batches = [];
   return next;
 }
 
@@ -734,6 +761,149 @@ export function withdrawDecision(project: Project, actionId: string, decisionId:
     source: { ...action.source, updated_at: new Date().toISOString() },
   };
   return { ...project, actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)) };
+}
+
+export function createReviewBatch(project: Project, actionIds?: string[]): Project {
+  const wanted = new Set(actionIds ?? []);
+  const items: ReviewItem[] = (project.actions ?? [])
+    .filter((action) => wanted.size === 0 || wanted.has(action.id))
+    .map((action) => ({
+      id: `${action.id}-item`,
+      action_id: action.id,
+      status: "pending" as const,
+      decisions: analyzeRebake(project, action).map((segment) => ({
+        segment: { start: segment.start, end: segment.end, bones: [...segment.bones] },
+        resolution: "pending" as const,
+        status: "draft" as const,
+        basis: segment.basis,
+      })),
+    }))
+    .filter((item) => item.decisions.length > 0);
+  if (items.length === 0) throw new Error("没有受当前源修订影响的整理动作");
+  const batch: ReviewBatch = {
+    id: `review-batch-${(project.review_batches ?? []).length + 1}`,
+    source_version: project.version,
+    status: "open",
+    created_at: new Date().toISOString(),
+    items,
+  };
+  return { ...project, review_batches: [...(project.review_batches ?? []), batch] };
+}
+
+export function refreshReviewBatch(project: Project, batchId: string): Project {
+  const updated: Project = structuredClone(project);
+  const batch = updated.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error(`找不到审阅批次 ${batchId}`);
+  const actionsById = new Map((updated.actions ?? []).map((action) => [action.id, action]));
+  batch.items.forEach((item) => {
+    const action = actionsById.get(item.action_id);
+    if (!action) return;
+    const published = item.decisions.filter((decision) => decision.status === "published");
+    const drafts = item.decisions.filter((decision) => decision.status !== "published");
+    const fresh: ReviewDecision[] = analyzeRebake(updated, action)
+      .filter((segment) => !published.some((decision) => decision.source_version === updated.version
+        && segmentsIntersect(decision.segment, segment)))
+      .map((segment) => {
+        const retained = drafts.find((decision) => decision.status === "draft"
+          && (decision.resolution === "source" || decision.resolution === "keep")
+          && segmentsIntersect(decision.segment, segment));
+        return {
+          segment: { start: segment.start, end: segment.end, bones: [...segment.bones] },
+          resolution: retained?.resolution ?? "pending",
+          status: "draft" as const,
+          basis: segment.basis,
+        };
+      });
+    item.decisions = [...published, ...fresh];
+    item.status = fresh.length ? "pending" : (published.length ? "completed" : "pending");
+  });
+  batch.source_version = updated.version;
+  batch.status = batch.items.every((item) => item.status === "completed") ? "completed" : "open";
+  return updated;
+}
+
+export function saveReviewBatch(
+  project: Project,
+  batchId: string,
+  choices: Record<string, ReviewDecision["resolution"][]>,
+): Project {
+  const refreshed = refreshReviewBatch(project, batchId);
+  const updated: Project = structuredClone(refreshed);
+  const batch = updated.review_batches!.find((item) => item.id === batchId)!;
+  batch.items.forEach((item) => {
+    const values = choices[item.action_id];
+    if (!values || values.length !== item.decisions.length) throw new Error(`审阅项 ${item.action_id} 的决定数量不完整`);
+    item.decisions.forEach((decision, index) => {
+      if (!["source", "keep", "pending"].includes(values[index])) throw new Error("草稿决定必须采用源、保留旧依据或待定");
+      if (decision.status !== "published" && decision.status !== "canceled") {
+        decision.resolution = values[index];
+        decision.status = "draft";
+        decision.saved_at = new Date().toISOString();
+      }
+    });
+  });
+  return updated;
+}
+
+export function submitReviewBatch(
+  project: Project,
+  batchId: string,
+  choices: Record<string, ReviewDecision["resolution"][]>,
+  submitActionIds: string[],
+): Project {
+  let saved = saveReviewBatch(project, batchId, choices);
+  const submitIds = new Set(submitActionIds);
+  const batch = saved.review_batches!.find((item) => item.id === batchId)!;
+  batch.items.forEach((item) => {
+    if (!submitIds.has(item.action_id)) return;
+    const decisions = item.decisions
+      .filter((decision) => decision.status !== "published" && (decision.resolution === "source" || decision.resolution === "keep"));
+    if (decisions.length === 0) return;
+    decisions.forEach((decision) => { decision.source_version = saved.version; });
+    const before = saved.actions!.find((action) => action.id === item.action_id)!;
+    const beforeCount = before.decision_log?.length ?? 0;
+    saved = applyRebake(
+      saved,
+      item.action_id,
+      decisions.map((decision) => ({
+        segment: decision.segment,
+        resolution: decision.resolution as "source" | "keep",
+      })),
+    );
+    const after = saved.actions!.find((action) => action.id === item.action_id)!;
+    after.decision_log?.slice(beforeCount).forEach((entry, index) => {
+      decisions[index].status = "published";
+      decisions[index].published_id = entry.id;
+      decisions[index].published_at = new Date().toISOString();
+    });
+  });
+  const updated: Project = { ...saved };
+  batch.items.forEach((item) => {
+    item.status = item.decisions.some((decision) => decision.status !== "published") ? "pending" : "completed";
+  });
+  batch.status = batch.items.every((item) => item.status === "completed") ? "completed" : "open";
+  return updated;
+}
+
+export function cancelReviewDecision(
+  project: Project,
+  batchId: string,
+  actionId: string,
+  segment: { start: number; end: number; bones: string[] },
+): Project {
+  const updated = structuredClone(project);
+  const batch = updated.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error(`找不到审阅批次 ${batchId}`);
+  const item = batch.items.find((entry) => entry.action_id === actionId);
+  if (!item) throw new Error(`批次中找不到动作 ${actionId}`);
+  const decision = item.decisions.find((entry) => entry.status === "draft" && segmentsIntersect(entry.segment, segment));
+  if (!decision) throw new Error("找不到可取消的未发布决定");
+  decision.resolution = "pending";
+  decision.status = "canceled";
+  decision.canceled_at = new Date().toISOString();
+  item.status = "pending";
+  batch.status = "open";
+  return updated;
 }
 
 export type ContinuityReport = {

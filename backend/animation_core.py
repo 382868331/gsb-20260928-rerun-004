@@ -339,6 +339,61 @@ def validate_project(project: dict[str, Any]) -> list[str]:
 
     errors.extend(validate_clip(project, duration, skeleton))
 
+    batches = project.get("review_batches", [])
+    if batches is None:
+        batches = []
+    if not isinstance(batches, list):
+        errors.append("源修订审阅批次必须是数组")
+        batches = []
+    batch_ids: set[str] = set()
+    for batch_index, batch in enumerate(batches):
+        prefix = f"第 {batch_index + 1} 个源修订审阅批次"
+        if not isinstance(batch, dict):
+            errors.append(f"{prefix}必须是对象")
+            continue
+        batch_id = batch.get("id")
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            errors.append(f"{prefix}缺少有效 id")
+        elif batch_id in batch_ids:
+            errors.append(f"{prefix}id 重复：{batch_id}")
+        else:
+            batch_ids.add(batch_id)
+        if batch.get("status", "open") not in ("open", "completed"):
+            errors.append(f"{prefix}状态必须是 open 或 completed")
+        source_version = batch.get("source_version")
+        if not isinstance(source_version, int) or source_version < 1:
+            errors.append(f"{prefix}缺少源版本号")
+        items = batch.get("items", [])
+        if not isinstance(items, list):
+            errors.append(f"{prefix}的审阅项必须是数组")
+            continue
+        item_ids: set[str] = set()
+        for item_index, item in enumerate(items):
+            item_prefix = f"{prefix}第 {item_index + 1} 个审阅项"
+            if not isinstance(item, dict):
+                errors.append(f"{item_prefix}必须是对象")
+                continue
+            item_id = item.get("id")
+            if not isinstance(item_id, str) or not item_id.strip():
+                errors.append(f"{item_prefix}缺少有效 id")
+            elif item_id in item_ids:
+                errors.append(f"{item_prefix}id 重复：{item_id}")
+            else:
+                item_ids.add(item_id)
+            if not isinstance(item.get("action_id"), str) or not item["action_id"].strip():
+                errors.append(f"{item_prefix}缺少整理动作 id")
+            if item.get("status", "pending") not in ("pending", "submitted", "completed"):
+                errors.append(f"{item_prefix}状态无效")
+            for decision_index, decision in enumerate(item.get("decisions", []) or []):
+                decision_prefix = f"{item_prefix}第 {decision_index + 1} 个草稿决定"
+                if not isinstance(decision, dict):
+                    errors.append(f"{decision_prefix}必须是对象")
+                    continue
+                if decision.get("resolution") not in ("source", "keep", "pending"):
+                    errors.append(f"{decision_prefix}必须采用源、保留旧依据或待定")
+                if decision.get("status", "draft") not in ("draft", "published", "canceled"):
+                    errors.append(f"{decision_prefix}状态无效")
+
     actions = project.get("actions", [])
     if actions is None:
         actions = []
@@ -1117,6 +1172,239 @@ def withdraw_decision(
     return updated
 
 
+def create_review_batch(project: dict[str, Any], action_ids: list[str] | None = None, batch_id: str | None = None) -> dict[str, Any]:
+    """Create one persistent review batch for actions affected by the source."""
+    actions = list(project.get("actions", []) or [])
+    wanted = {str(item) for item in (action_ids or [])}
+    items: list[dict[str, Any]] = []
+    for action in actions:
+        if wanted and action.get("id") not in wanted:
+            continue
+        segments = analyze_rebake(project, action)
+        if not segments:
+            continue
+        decisions = [
+            {
+                "segment": {
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "bones": list(segment["bones"]),
+                },
+                "resolution": "pending",
+                "status": "draft",
+                "basis": deepcopy(segment.get("basis", [])),
+            }
+            for segment in segments
+        ]
+        items.append({
+            "id": f"{action['id']}-item",
+            "action_id": action["id"],
+            "status": "pending",
+            "decisions": decisions,
+        })
+    if not items:
+        raise ValueError("没有受当前源修订影响的整理动作")
+    existing = list(project.get("review_batches", []) or [])
+    new_id = batch_id or f"review-batch-{len(existing) + 1}"
+    if any(batch.get("id") == new_id for batch in existing):
+        raise ValueError(f"审阅批次 id 重复：{new_id}")
+    batch = {
+        "id": new_id,
+        "source_version": int(project.get("version", 1)),
+        "status": "open",
+        "created_at": _utc_now_iso(),
+        "items": items,
+    }
+    updated = deepcopy(project)
+    updated["review_batches"] = existing + [batch]
+    return updated
+
+
+def _find_review_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    batch = next(
+        (item for item in project.get("review_batches", []) or [] if item.get("id") == batch_id),
+        None,
+    )
+    if batch is None:
+        raise ValueError(f"找不到审阅批次 {batch_id}")
+    return batch
+
+
+def refresh_review_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Reopen or update a saved batch against the latest source revision."""
+    _find_review_batch(project, batch_id)
+    updated = deepcopy(project)
+    batch = next(item for item in updated["review_batches"] if item.get("id") == batch_id)
+    if batch.get("status") == "completed" and int(batch.get("source_version", 0)) >= int(updated.get("version", 1)):
+        return updated
+    actions_by_id = {action.get("id"): action for action in updated.get("actions", []) or []}
+    for item in batch.get("items", []):
+        action = actions_by_id.get(item.get("action_id"))
+        if action is None:
+            continue
+        old_decisions = list(item.get("decisions", []) or [])
+        published = [decision for decision in old_decisions if decision.get("status") == "published"]
+        active_drafts = [decision for decision in old_decisions if decision.get("status") != "published"]
+        current_segments = analyze_rebake(project, action)
+        fresh: list[dict[str, Any]] = []
+        for segment in current_segments:
+            current_publication = next(
+                (
+                    decision for decision in published
+                    if decision.get("source_version") == int(project.get("version", 1))
+                    and _segments_intersect(decision.get("segment") or {}, segment)
+                ),
+                None,
+            )
+            if current_publication is not None:
+                continue
+            matching = next(
+                (
+                    decision for decision in active_drafts
+                    if decision.get("status") == "draft"
+                    and decision.get("resolution") in ("source", "keep")
+                    and _segments_intersect(decision.get("segment") or {}, segment)
+                ),
+                None,
+            )
+            fresh.append({
+                "segment": {
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "bones": list(segment["bones"]),
+                },
+                "resolution": matching["resolution"] if matching is not None else "pending",
+                "status": "draft",
+                "basis": deepcopy(segment.get("basis", [])),
+            })
+        item["decisions"] = published + fresh
+        item["status"] = "pending" if fresh else ("completed" if published else "pending")
+    batch["source_version"] = int(updated.get("version", 1))
+    if any(item.get("status") != "completed" for item in batch.get("items", [])):
+        batch["status"] = "open"
+    else:
+        batch["status"] = "completed"
+        batch["completed_at"] = _utc_now_iso()
+    return updated
+
+
+def save_review_batch(
+    project: dict[str, Any],
+    batch_id: str,
+    item_decisions: dict[str, list[dict[str, Any]]] | list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Persist explicit and pending per-item decisions without publishing them."""
+    project = refresh_review_batch(project, batch_id)
+    if isinstance(item_decisions, dict):
+        grouped = {str(key): list(value or []) for key, value in item_decisions.items()}
+    else:
+        grouped = {}
+        for entry in item_decisions or []:
+            if not isinstance(entry, dict):
+                raise ValueError("审阅项决定必须是对象")
+            grouped.setdefault(str(entry.get("action_id") or entry.get("item_id")), []).extend(
+                entry.get("decisions", []) or []
+            )
+
+    updated = deepcopy(project)
+    batch = next(item for item in updated["review_batches"] if item.get("id") == batch_id)
+    for item in batch.get("items", []):
+        incoming = grouped.get(item["action_id"], grouped.get(item["id"], []))
+        if len(incoming) != len(item.get("decisions", [])):
+            raise ValueError(f"审阅项 {item['action_id']} 的决定数量不完整")
+        for current, value in zip(item["decisions"], incoming):
+            if not isinstance(value, dict):
+                raise ValueError("草稿决定必须是对象")
+            resolution = value.get("resolution", "pending")
+            if resolution not in ("source", "keep", "pending"):
+                raise ValueError("草稿决定必须采用源、保留旧依据或待定")
+            current["resolution"] = resolution
+            if current.get("status") in ("published", "canceled"):
+                current["status"] = current["status"]
+            else:
+                current["status"] = "draft"
+            current["saved_at"] = _utc_now_iso()
+    return updated
+
+
+def submit_review_batch(
+    project: dict[str, Any],
+    batch_id: str,
+    item_decisions: dict[str, list[dict[str, Any]]] | list[dict[str, Any]] | None = None,
+    submit_action_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Publish only explicitly decided items; pending decisions remain saved."""
+    if item_decisions is not None:
+        project = save_review_batch(project, batch_id, item_decisions)
+    else:
+        project = refresh_review_batch(project, batch_id)
+    updated = deepcopy(project)
+    batch = next(item for item in updated["review_batches"] if item.get("id") == batch_id)
+    submit_ids = {str(item_id) for item_id in (submit_action_ids or [])}
+    actions_by_id = {action.get("id"): index for index, action in enumerate(updated.get("actions", []) or [])}
+    for item in batch.get("items", []):
+        decisions = [
+            decision for decision in item.get("decisions", [])
+            if decision.get("status") != "published" and decision.get("resolution") in ("source", "keep")
+        ]
+        if not decisions or (submit_ids and item.get("action_id") not in submit_ids):
+            item["status"] = "pending" if item.get("status") != "submitted" else "submitted"
+            continue
+        action_index = actions_by_id.get(item["action_id"])
+        if action_index is None:
+            raise ValueError(f"找不到审阅项动作 {item['action_id']}")
+        for decision in decisions:
+            decision["source_version"] = int(updated.get("version", 1))
+        updated_action = apply_rebake(
+            updated,
+            item["action_id"],
+            [{"segment": decision["segment"], "resolution": decision["resolution"]} for decision in decisions],
+        )
+        updated["actions"][action_index] = updated_action
+        new_entries = updated_action.get("decision_log", [])[-len(decisions):]
+        for decision, entry in zip(decisions, new_entries):
+            decision["status"] = "published"
+            decision["published_id"] = entry.get("id")
+            decision["published_at"] = _utc_now_iso()
+        pending = [decision for decision in item["decisions"] if decision.get("status") != "published"]
+        item["status"] = "pending" if pending else "completed"
+    if all(item.get("status") == "completed" for item in batch.get("items", [])):
+        batch["status"] = "completed"
+        batch["completed_at"] = _utc_now_iso()
+    return updated
+
+
+def cancel_review_decision(
+    project: dict[str, Any],
+    batch_id: str,
+    action_id: str,
+    segment: dict[str, Any],
+) -> dict[str, Any]:
+    """Cancel an unpublished batch decision without touching published revisions."""
+    updated = deepcopy(project)
+    batch = next(item for item in updated["review_batches"] if item.get("id") == batch_id)
+    item = next((entry for entry in batch.get("items", []) if entry.get("action_id") == action_id), None)
+    if item is None:
+        raise ValueError(f"批次中找不到动作 {action_id}")
+    target = next(
+        (
+            decision for decision in item.get("decisions", [])
+            if decision.get("status") == "draft"
+            and _segments_intersect(decision.get("segment") or {}, segment)
+        ),
+        None,
+    )
+    if target is None:
+        raise ValueError("找不到可取消的未发布决定")
+    target["resolution"] = "pending"
+    target["status"] = "canceled"
+    target["canceled_at"] = _utc_now_iso()
+    if item.get("status") == "completed":
+        item["status"] = "pending"
+        batch["status"] = "open"
+    return updated
+
+
 def sample_local(project: dict[str, Any], time: float) -> dict[str, dict[str, float]]:
     duration = float(project.get("duration", 0.0))
     clamped_time = min(max(float(time), 0.0), duration)
@@ -1189,6 +1477,7 @@ def migrate_project(project: dict[str, Any]) -> dict[str, Any]:
         return project
     project.setdefault("version", 1)
     project.setdefault("actions", [])
+    project.setdefault("review_batches", [])
     for layer in project.get("layers", []) or []:
         if isinstance(layer, dict):
             layer.setdefault("weight_keys", [])

@@ -8,6 +8,8 @@ from animation_core import (
     analyze_rebake,
     apply_rebake,
     bake_action,
+    cancel_review_decision,
+    create_review_batch,
     create_variant,
     default_project,
     evaluate_world,
@@ -16,7 +18,10 @@ from animation_core import (
     load_project,
     migrate_project,
     publish_variant,
+    refresh_review_batch,
+    save_review_batch,
     sample_local,
+    submit_review_batch,
     weight_key_multiplier,
     shortest_angle_delta,
     validate_project,
@@ -304,6 +309,95 @@ class AnimationCoreTests(unittest.TestCase):
         # the sibling action sharing the same source is untouched and still pending
         self.assertEqual(turn["revision"], 1)
         self.assertEqual(analyze_rebake(project, turn), turn_segments)
+
+    def test_review_batch_keeps_pending_decisions_across_revision_and_cancel(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        walk = bake_action(project, 0.0, 0.5, bone_ids, "走路上身", action_id="walk")
+        turn = bake_action(project, 0.7, 1.2, bone_ids, "转身上身", action_id="turn")
+        project["actions"] = [walk, turn]
+        project["version"] = 2
+        project["keyframes"][0]["pose"]["spine"]["rotation"] = 9.0
+        project["keyframes"][2]["pose"]["spine"]["rotation"] = -9.0
+
+        project = create_review_batch(project, batch_id="batch-v2")
+        batch = project["review_batches"][0]
+        self.assertEqual([item["action_id"] for item in batch["items"]], ["walk", "turn"])
+        self.assertTrue(all(
+            decision["resolution"] == "pending"
+            for item in batch["items"] for decision in item["decisions"]
+        ))
+
+        choices = {}
+        for item in batch["items"]:
+            decisions = [{"resolution": "pending"} for _ in item["decisions"]]
+            decisions[0]["resolution"] = "keep" if item["action_id"] == "walk" else "source"
+            choices[item["action_id"]] = decisions
+        reloaded = json.loads(json.dumps(project))
+        self.assertEqual(validate_project(reloaded), [])
+        saved = save_review_batch(reloaded, "batch-v2", choices)
+        walk_item, turn_item = saved["review_batches"][0]["items"]
+        self.assertEqual(walk_item["decisions"][0]["resolution"], "keep")
+        self.assertTrue(all(decision["status"] == "draft" for decision in walk_item["decisions"]))
+        saved_walk = next(action for action in saved["actions"] if action["id"] == "walk")
+        self.assertEqual(saved_walk["revision"], 1)
+
+        submitted = submit_review_batch(saved, "batch-v2", submit_action_ids=["turn"])
+        walk_item, turn_item = submitted["review_batches"][0]["items"]
+        walk = next(action for action in submitted["actions"] if action["id"] == "walk")
+        turn = next(action for action in submitted["actions"] if action["id"] == "turn")
+        self.assertEqual(walk["revision"], 1)
+        self.assertEqual(turn["revision"], 2)
+        self.assertEqual(len(turn["decision_log"]), len(turn_item["decisions"]))
+        self.assertTrue(any(
+            decision["status"] == "draft" and decision["resolution"] == "keep"
+            for decision in walk_item["decisions"]
+        ))
+        self.assertTrue(any(
+            decision["status"] == "published"
+            for decision in turn_item["decisions"]
+        ))
+
+        submitted["version"] = 3
+        submitted["keyframes"][2]["pose"]["spine"]["rotation"] = -14.0
+        reopened = json.loads(json.dumps(submitted))
+        refreshed = refresh_review_batch(reopened, "batch-v2")
+        walk_item, turn_item = refreshed["review_batches"][0]["items"]
+        self.assertTrue(any(
+            decision["resolution"] == "keep" and decision["status"] == "draft"
+            for decision in walk_item["decisions"]
+        ))
+        self.assertTrue(all(
+            decision["resolution"] == "pending" and decision["status"] == "draft"
+            for decision in turn_item["decisions"]
+            if "published_id" not in decision
+        ))
+        self.assertTrue(all(
+            decision["status"] == "published" and decision["source_version"] == 2
+            for decision in turn_item["decisions"] if "published_id" in decision
+        ))
+
+        walk_draft = next(
+            decision for decision in walk_item["decisions"]
+            if decision["status"] == "draft" and decision["resolution"] == "keep"
+        )
+        canceled = cancel_review_decision(
+            refreshed,
+            "batch-v2",
+            "walk",
+            walk_draft["segment"],
+        )
+        canceled_walk = next(
+            item for item in canceled["review_batches"][0]["items"] if item["action_id"] == "walk"
+        )
+        self.assertTrue(any(
+            decision["status"] == "canceled" and decision["resolution"] == "pending"
+            for decision in canceled_walk["decisions"]
+        ))
+        canceled_turn = next(action for action in canceled["actions"] if action["id"] == "turn")
+        self.assertEqual(canceled_turn["revision"], 2)
+        self.assertTrue(all(entry["status"] == "active" for entry in canceled_turn["decision_log"]))
+        self.assertEqual(validate_project(canceled), [])
 
     def test_variants_keep_manual_with_source_version_and_publish_independently(self):
         project, _ = self._project_with_shared_source_actions()
