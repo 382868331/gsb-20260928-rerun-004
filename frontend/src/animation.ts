@@ -40,6 +40,7 @@ export type DecisionRecord = {
   id: string;
   revision: number;
   variant_id?: string | null;
+  batch_id?: string | null;
   segment: { start: number; end: number; bones: string[] };
   resolution: "source" | "keep";
   source_version: number;
@@ -67,6 +68,25 @@ export type Action = {
   variants?: ActionVariant[];
   source: BakedSource;
 };
+export type ReviewChoice = "pending" | "keep" | "source";
+export type ReviewBatchItem = {
+  action_id: string;
+  variant_id: string | null;
+  choice: ReviewChoice;
+  confirmed_source_version: number;
+  status: "pending" | "applied" | "published";
+  pre_keyframes?: Keyframe[] | null;
+  pre_revision?: number | null;
+};
+export type ReviewBatch = {
+  id: string;
+  name: string;
+  source_version: number;
+  status: "open" | "closed" | "cancelled";
+  created_at?: string;
+  closed_at?: string;
+  items: ReviewBatchItem[];
+};
 export type Project = {
   name: string;
   version: number;
@@ -75,6 +95,7 @@ export type Project = {
   keyframes: Keyframe[];
   layers?: Layer[];
   actions?: Action[];
+  review_batches?: ReviewBatch[];
 };
 export type Clip = Pick<Project, "duration" | "keyframes"> & { layers?: Layer[] };
 
@@ -194,10 +215,12 @@ export function validateProject(project: Project): string[] {
   errors.push(...validateClipContent(project, project.duration, bones));
 
   const actionIds = new Set<string>();
+  const actionsById = new Map<string, Action>();
   (project.actions ?? []).forEach((action, actionIndex) => {
     const prefix = `第 ${actionIndex + 1} 个整理动作`;
     if (actionIds.has(action.id)) errors.push(`${prefix}id 重复：${action.id}`);
     actionIds.add(action.id);
+    actionsById.set(action.id, action);
     if (!Number.isFinite(action.duration) || action.duration <= 0) {
       errors.push(`${prefix}的时长必须是正数`);
       return;
@@ -217,8 +240,11 @@ export function validateProject(project: Project): string[] {
       else if (decisionIds.has(entry.id)) errors.push(`${entryPrefix}id 重复：${entry.id}`);
       else decisionIds.add(entry.id);
       if (entry.resolution !== "source" && entry.resolution !== "keep") errors.push(`${entryPrefix}的决定必须是 source 或 keep`);
-      if (entry.status !== undefined && entry.status !== "active" && entry.status !== "withdrawn") {
-        errors.push(`${entryPrefix}的状态必须是 active 或 withdrawn`);
+     if (entry.status !== undefined && entry.status !== "active" && entry.status !== "withdrawn") {
+       errors.push(`${entryPrefix}的状态必须是 active 或 withdrawn`);
+     }
+      if (entry.batch_id !== undefined && entry.batch_id !== null && typeof entry.batch_id !== "string") {
+        errors.push(entryPrefix + "的批次 id 必须是字符串");
       }
       if (!Number.isInteger(entry.source_version) || entry.source_version < 1) errors.push(`${entryPrefix}缺少采用依据的源版本号`);
       if (!Number.isFinite(entry.segment?.start) || !Number.isFinite(entry.segment?.end)
@@ -236,6 +262,48 @@ export function validateProject(project: Project): string[] {
       errors.push(...validateClipContent({ keyframes: variant.keyframes, layers: [] }, action.duration, bones, `${variantPrefix}内`));
     });
     errors.push(...validateClipContent(action, action.duration, bones, `${prefix}内`));
+  });
+  const batchIds = new Set<string>();
+  (project.review_batches ?? []).forEach((batch, batchIndex) => {
+    const prefix = "第 " + (batchIndex + 1) + " 个审阅批次";
+    if (!batch.id) errors.push(prefix + "缺少有效 id");
+    else if (batchIds.has(batch.id)) errors.push(prefix + "id 重复：" + batch.id);
+    else batchIds.add(batch.id);
+    if (!batch.name) errors.push(prefix + "缺少名称");
+    if (!["open", "closed", "cancelled"].includes(batch.status)) {
+      errors.push(prefix + "的状态必须是 open、closed 或 cancelled");
+    }
+    if (!Number.isInteger(batch.source_version) || batch.source_version < 1) {
+      errors.push(prefix + "缺少所审阅的源版本号");
+    }
+    if (!Array.isArray(batch.items) || batch.items.length === 0) {
+      errors.push(prefix + "至少需要一个审阅项");
+      return;
+    }
+    const seenItems = new Set<string>();
+    batch.items.forEach((item, itemIndex) => {
+      const itemPrefix = prefix + "第 " + (itemIndex + 1) + " 个审阅项";
+      const action = actionsById.get(item.action_id);
+      if (!action) {
+        errors.push(itemPrefix + "引用了未知整理动作 " + item.action_id);
+        return;
+      }
+      if (item.variant_id !== null && !(action.variants ?? []).some((variant) => variant.id === item.variant_id)) {
+        errors.push(itemPrefix + "引用了未知方案 " + item.variant_id);
+      }
+      const itemKey = item.action_id + "|" + (item.variant_id ?? "");
+      if (seenItems.has(itemKey)) errors.push(itemPrefix + "重复");
+      seenItems.add(itemKey);
+      if (!["pending", "keep", "source"].includes(item.choice)) {
+        errors.push(itemPrefix + "的选择必须是 pending、keep 或 source");
+      }
+      if (!["pending", "applied", "published"].includes(item.status)) {
+        errors.push(itemPrefix + "的状态必须是 pending、applied 或 published");
+      }
+      if (!Number.isInteger(item.confirmed_source_version) || item.confirmed_source_version < 1) {
+        errors.push(itemPrefix + "缺少确认依据的源版本号");
+      }
+    });
   });
   return errors;
 }
@@ -474,6 +542,7 @@ export function migrateProject(project: Project): Project {
   const next = structuredClone(project);
   if (!Number.isInteger(next.version)) next.version = 1;
   if (!next.actions) next.actions = [];
+  if (!next.review_batches) next.review_batches = [];
   (next.layers ?? []).forEach((layer) => { if (!layer.weight_keys) layer.weight_keys = []; });
   next.actions.forEach((action) => {
     if (!Number.isInteger(action.revision)) action.revision = 1;
@@ -552,7 +621,7 @@ export function analyzeRebake(project: Project, action: Action): RebakeSegment[]
 
 export type RebakeDecision = { segment: { start: number; end: number; bones?: string[] }; resolution: "source" | "keep" };
 
-export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[], variantId?: string | null): Project {
+export function applyRebake(project: Project, actionId: string, decisions: RebakeDecision[], variantId?: string | null, batchId?: string | null): Project {
   const action = project.actions?.find((item) => item.id === actionId);
   if (!action) throw new Error(`找不到整理动作 ${actionId}`);
   const confirmed = decisions.filter((decision) => decision.resolution === "source" || decision.resolution === "keep");
@@ -597,6 +666,7 @@ export function applyRebake(project: Project, actionId: string, decisions: Rebak
     id: `${actionId}-d${(action.decision_log ?? []).length + index + 1}`,
     revision,
     variant_id: variantId ?? null,
+    batch_id: batchId ?? null,
     segment: {
       start: decision.segment.start,
       end: decision.segment.end,
@@ -678,6 +748,199 @@ export function publishVariant(project: Project, actionId: string, variantId: st
   };
   if (analyzeRebake(project, updated).length === 0) updated.source.source_version = project.version;
   return { ...project, actions: (project.actions ?? []).map((item) => (item.id === actionId ? updated : item)) };
+}
+
+export function createReviewBatch(project: Project, entries: { action_id: string; variant_id?: string | null }[], name = ""): Project {
+  const batches = [...(project.review_batches ?? [])];
+  const id = "batch-" + (batches.length + 1);
+  if (batches.some((batch) => batch.id === id)) throw new Error("审阅批次 id 重复：" + id);
+  const seen = new Set<string>();
+  const items: ReviewBatchItem[] = entries.map((entry) => {
+    const action = project.actions?.find((item) => item.id === entry.action_id);
+    if (!action) throw new Error("找不到整理动作 " + entry.action_id);
+    const variantId = entry.variant_id ?? null;
+    const key = entry.action_id + "|" + (variantId ?? "");
+    if (seen.has(key)) throw new Error("审阅项重复：" + key);
+    seen.add(key);
+    if (variantId !== null) {
+      const variant = action.variants?.find((item) => item.id === variantId);
+      if (!variant) throw new Error("找不到方案 " + variantId);
+      if (variant.status !== "draft") throw new Error("方案「" + variant.name + "」已发布，不能加入审阅批次");
+    }
+    return {
+      action_id: entry.action_id,
+      variant_id: variantId,
+      choice: "pending" as const,
+      confirmed_source_version: project.version,
+      status: "pending" as const,
+      pre_keyframes: null,
+      pre_revision: null,
+    };
+  });
+  if (items.length === 0) throw new Error("审阅批次至少需要一个审阅项");
+  batches.push({
+    id,
+    name: name || "审阅批次 " + batches.length,
+    source_version: project.version,
+    status: "open",
+    created_at: new Date().toISOString(),
+    items,
+  });
+  return { ...project, review_batches: batches };
+}
+
+const findReviewBatch = (project: Project, batchId: string) => {
+  const batch = project.review_batches?.find((item) => item.id === batchId);
+  if (!batch) throw new Error("找不到审阅批次 " + batchId);
+  return batch;
+};
+
+export function setReviewChoice(project: Project, batchId: string, actionId: string, variantId: string | null, choice: ReviewChoice): Project {
+  if (!["pending", "keep", "source"].includes(choice)) throw new Error("未知审阅选择 " + choice);
+  const next = structuredClone(project);
+  const batch = findReviewBatch(next, batchId);
+  if (batch.status !== "open") throw new Error("批次已关闭或取消，不能再修改选择");
+  const item = batch.items.find((entry) => entry.action_id === actionId && entry.variant_id === variantId);
+  if (!item) throw new Error("批次 " + batchId + " 中没有 " + actionId + "/" + (variantId ?? "当前动作") + " 审阅项");
+  if (item.status !== "pending") throw new Error("该审阅项已提交，不能再修改选择");
+  item.choice = choice;
+  item.confirmed_source_version = next.version;
+  return next;
+}
+
+export type ReviewItemView = {
+  action_id: string;
+  variant_id: string | null;
+  action_name: string;
+  variant_name: string | null;
+  choice: ReviewChoice;
+  status: ReviewBatchItem["status"];
+  published: boolean;
+  needs_reconfirm: boolean;
+  unhandled: RebakeSegment[];
+  final_revision: number;
+};
+
+const reviewItemView = (project: Project, item: ReviewBatchItem): ReviewItemView => {
+  const action = project.actions?.find((entry) => entry.id === item.action_id);
+  if (!action) throw new Error("找不到整理动作 " + item.action_id);
+  const variant = item.variant_id === null ? null : action.variants?.find((entry) => entry.id === item.variant_id) ?? null;
+  if (item.variant_id !== null && !variant) throw new Error("找不到方案 " + item.variant_id);
+  const target = variant ?? action;
+  const unhandled = analyzeRebake(project, { ...action, keyframes: target.keyframes });
+  const published = item.status === "published"
+    || (variant !== null && variant.status === "published")
+    || (variant === null && item.status === "applied");
+  const currentRevision = target.revision ?? 1;
+  return {
+    action_id: item.action_id,
+    variant_id: item.variant_id,
+    action_name: action.name,
+    variant_name: variant?.name ?? null,
+    choice: item.choice,
+    status: item.status,
+    published,
+    needs_reconfirm: !published && item.status === "pending" && item.confirmed_source_version !== project.version,
+    unhandled,
+    final_revision: item.choice !== "pending" && unhandled.length > 0 && !published ? currentRevision + 1 : currentRevision,
+  };
+};
+
+export function reviewBatchSummary(project: Project, batchId: string) {
+  const batch = findReviewBatch(project, batchId);
+  return {
+    id: batch.id,
+    name: batch.name,
+    status: batch.status,
+    source_version: batch.source_version,
+    items: batch.items.map((item) => reviewItemView(project, item)),
+  };
+}
+
+export function submitReviewBatch(project: Project, batchId: string): Project {
+  const batch = findReviewBatch(project, batchId);
+  if (batch.status !== "open") throw new Error("批次已关闭或取消，不能再提交");
+  const ready = batch.items.filter((item) => item.status === "pending" && item.choice !== "pending");
+  if (ready.length === 0) throw new Error("没有可提交的决定：各项仍为待决定或已处理");
+  const stale = ready.filter((item) => item.confirmed_source_version !== project.version);
+  if (stale.length > 0) {
+    throw new Error("源已再次修订，以下审阅项需重新确认：" + stale.map((item) => item.action_id + "/" + (item.variant_id ?? "当前动作")).join("、"));
+  }
+  let next = project;
+  ready.forEach((item) => {
+    const action = next.actions?.find((entry) => entry.id === item.action_id);
+    if (!action) throw new Error("找不到整理动作 " + item.action_id);
+    const variant = item.variant_id === null ? null : action.variants?.find((entry) => entry.id === item.variant_id) ?? null;
+    const target = variant ?? action;
+    if (!target) throw new Error("找不到方案 " + item.variant_id);
+    const segments = analyzeRebake(next, { ...action, keyframes: target.keyframes });
+    const preKeyframes = structuredClone(target.keyframes);
+    const preRevision = target.revision ?? 1;
+    if (segments.length > 0) {
+      next = applyRebake(next, item.action_id, segments.map((segment) => ({
+        segment: { start: segment.start, end: segment.end, bones: segment.bones },
+        resolution: item.choice as "source" | "keep",
+      })), item.variant_id, batchId);
+    }
+    next = {
+      ...next,
+      review_batches: (next.review_batches ?? []).map((entry) => entry.id === batchId
+        ? {
+            ...entry,
+            items: entry.items.map((candidate) => candidate.action_id === item.action_id && candidate.variant_id === item.variant_id
+              ? {
+                  ...candidate,
+                  status: (item.variant_id === null ? "published" : "applied") as ReviewBatchItem["status"],
+                  pre_keyframes: segments.length > 0 ? preKeyframes : candidate.pre_keyframes ?? null,
+                  pre_revision: segments.length > 0 ? preRevision : candidate.pre_revision ?? null,
+                }
+              : candidate),
+          }
+        : entry),
+    };
+  });
+  next = {
+    ...next,
+    review_batches: (next.review_batches ?? []).map((entry) => entry.id === batchId
+      ? {
+          ...entry,
+          status: entry.items.every((item) => item.status !== "pending") ? "closed" as const : entry.status,
+         closed_at: entry.items.every((item) => item.status !== "pending") ? new Date().toISOString() : entry.closed_at,
+       }
+     : entry),
+  };
+  return next;
+}
+
+export function cancelReviewBatch(project: Project, batchId: string): Project {
+  const batch = findReviewBatch(project, batchId);
+  if (batch.status === "cancelled") throw new Error("批次已取消");
+  const next = structuredClone(project);
+  const nextBatch = findReviewBatch(next, batchId);
+  nextBatch.items.forEach((item) => {
+    const action = next.actions?.find((entry) => entry.id === item.action_id);
+    if (!action) return;
+    const variant = item.variant_id === null ? null : action.variants?.find((entry) => entry.id === item.variant_id) ?? null;
+    const published = item.status === "published"
+      || (variant !== null && variant.status === "published")
+      || (item.variant_id === null && item.status === "applied");
+    if (published) return;
+    if (variant && item.pre_keyframes) {
+      variant.keyframes = structuredClone(item.pre_keyframes);
+      variant.revision = item.pre_revision ?? variant.revision;
+    }
+    action.decision_log = (action.decision_log ?? []).map((entry) =>
+      entry.batch_id === batchId && (entry.variant_id ?? null) === item.variant_id && (entry.status ?? "active") === "active"
+        ? { ...entry, status: "withdrawn" as const }
+        : entry);
+    item.status = "pending";
+    item.choice = "pending";
+    item.pre_keyframes = null;
+    item.pre_revision = null;
+  });
+  nextBatch.status = "cancelled";
+  nextBatch.closed_at = new Date().toISOString();
+  return next;
 }
 
 export type WithdrawalPreview = {

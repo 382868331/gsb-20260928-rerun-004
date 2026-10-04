@@ -8,6 +8,8 @@ from animation_core import (
     analyze_rebake,
     apply_rebake,
     bake_action,
+    cancel_review_batch,
+    create_review_batch,
     create_variant,
     default_project,
     evaluate_world,
@@ -16,7 +18,10 @@ from animation_core import (
     load_project,
     migrate_project,
     publish_variant,
+    review_batch_summary,
     sample_local,
+    set_review_choice,
+    submit_review_batch,
     weight_key_multiplier,
     shortest_angle_delta,
     validate_project,
@@ -451,6 +456,123 @@ class AnimationCoreTests(unittest.TestCase):
             withdraw_decision(project, "walk", log[0]["id"])
         withdrawn = withdraw_decision(project, "walk", log[0]["id"], confirm=True)
         self.assertEqual(withdrawn["decision_log"][0]["status"], "withdrawn")
+
+    def _project_with_shared_actions_and_drafts(self):
+        project, _ = self._project_with_shared_source_actions()
+        for action_id in ("walk", "turn"):
+            action = create_variant(project, action_id, f"{action_id}-方案A")
+            project["actions"] = [action if a["id"] == action_id else a for a in project["actions"]]
+            action = create_variant(project, action_id, f"{action_id}-方案B")
+            project["actions"] = [action if a["id"] == action_id else a for a in project["actions"]]
+        return project
+
+    def test_review_batch_partial_publish_reconfirm_and_cancel(self):
+        project = self._project_with_shared_actions_and_drafts()
+        # one source revision affects both shared actions
+        project["version"] = 2
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        walk_var_a = project["actions"][0]["variants"][0]["id"]
+        turn_var_a = project["actions"][1]["variants"][0]["id"]
+        turn_var_b = project["actions"][1]["variants"][1]["id"]
+
+        project = create_review_batch(project, [
+            {"action_id": "walk", "variant_id": None},
+            {"action_id": "walk", "variant_id": walk_var_a},
+            {"action_id": "turn", "variant_id": None},
+            {"action_id": "turn", "variant_id": turn_var_a},
+        ], name="v2 上身修订审阅")
+        batch_id = project["review_batches"][0]["id"]
+        self.assertEqual(validate_project(json.loads(json.dumps(project))), [])
+
+        # mid-review save/reload restores every choice and its basis
+        project = set_review_choice(project, batch_id, "walk", None, "source")
+        project = set_review_choice(project, batch_id, "walk", walk_var_a, "keep")
+        reloaded = migrate_project(json.loads(json.dumps(project)))
+        items = {(i["action_id"], i["variant_id"]): i for i in reloaded["review_batches"][0]["items"]}
+        self.assertEqual(items[("walk", None)]["choice"], "source")
+        self.assertEqual(items[("walk", walk_var_a)]["choice"], "keep")
+        self.assertTrue(all(i["confirmed_source_version"] == 2 for i in items.values()))
+
+        # pre-submit summary shows final revision and unhandled ranges per item
+        summary = review_batch_summary(project, batch_id)
+        views = {(i["action_id"], i["variant_id"]): i for i in summary["items"]}
+        self.assertTrue(views[("walk", None)]["unhandled"])
+        self.assertEqual(views[("walk", None)]["final_revision"], 2)
+        self.assertEqual(views[("turn", None)]["final_revision"], 1)  # 待决定不升修订
+
+        # submit publishes only the decided items; the rest stay drafts
+        project = submit_review_batch(project, batch_id)
+        walk = next(a for a in project["actions"] if a["id"] == "walk")
+        turn = next(a for a in project["actions"] if a["id"] == "turn")
+        self.assertEqual(walk["revision"], 2)
+        self.assertEqual(analyze_rebake(project, walk), [])
+        self.assertEqual(walk["variants"][0]["revision"], 2)  # 草稿已写入决定
+        self.assertEqual(walk["variants"][0]["status"], "draft")  # 但未随批次发布
+        self.assertEqual(turn["revision"], 1)  # 共用源版本也不一起发布
+        self.assertTrue(analyze_rebake(project, turn))
+        self.assertEqual(project["review_batches"][0]["status"], "open")
+        walk_log = [e for e in walk["decision_log"] if e.get("batch_id") == batch_id]
+        self.assertTrue(walk_log)
+        self.assertTrue(all(e["source_version"] == 2 for e in walk_log))
+
+        # publishing one variant must not publish the sibling drafts
+        published = publish_variant(project, "walk", walk_var_a)
+        project = {**project, "actions": [published if a["id"] == "walk" else a for a in project["actions"]]}
+        summary = review_batch_summary(project, batch_id)
+        views = {(i["action_id"], i["variant_id"]): i for i in summary["items"]}
+        self.assertTrue(views[("walk", walk_var_a)]["published"])
+
+        # an intersecting follow-up source revision forces explicit re-confirmation
+        project["version"] = 3
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 15.0
+        summary = review_batch_summary(project, batch_id)
+        views = {(i["action_id"], i["variant_id"]): i for i in summary["items"]}
+        self.assertTrue(views[("turn", None)]["needs_reconfirm"])
+        project = set_review_choice(project, batch_id, "turn", None, "source")
+        project = set_review_choice(project, batch_id, "turn", turn_var_a, "source")
+        with self.assertRaises(ValueError):
+            # turn_var_b was never in the batch; also stale choices are rejected
+            set_review_choice(project, batch_id, "turn", turn_var_b, "source")
+        project = submit_review_batch(project, batch_id)
+        self.assertEqual(project["review_batches"][0]["status"], "closed")
+        turn = next(a for a in project["actions"] if a["id"] == "turn")
+        self.assertEqual(turn["revision"], 2)
+        self.assertEqual(turn["variants"][0]["status"], "draft")
+        self.assertTrue(all(
+            e["source_version"] == 3 for e in turn["decision_log"] if e.get("batch_id") == batch_id
+        ))
+
+        # a second batch whose draft decisions are cancelled: only its own
+        # unpublished decisions are withdrawn, published results stay
+        project = create_review_batch(project, [
+            {"action_id": "turn", "variant_id": turn_var_b},
+        ], name="补充审阅")
+        batch2 = project["review_batches"][1]["id"]
+        project = set_review_choice(project, batch2, "turn", turn_var_b, "source")
+        before = next(a for a in project["actions"] if a["id"] == "turn")
+        pre_draft_frames = deepcopy(before["variants"][1]["keyframes"])
+        project = submit_review_batch(project, batch2)
+        after_submit = next(a for a in project["actions"] if a["id"] == "turn")
+        self.assertEqual(after_submit["variants"][1]["revision"], 2)
+        project = cancel_review_batch(project, batch2)
+        cancelled = next(a for a in project["actions"] if a["id"] == "turn")
+        self.assertEqual(cancelled["variants"][1]["keyframes"], pre_draft_frames)
+        self.assertEqual(cancelled["variants"][1]["revision"], 1)
+        self.assertTrue(all(
+            e["status"] == "withdrawn"
+            for e in cancelled["decision_log"] if e.get("batch_id") == batch2
+        ))
+        # the first batch's published results and action-level decisions remain
+        self.assertEqual(cancelled["revision"], 2)
+        self.assertTrue(all(
+            e["status"] == "active"
+            for e in cancelled["decision_log"] if e.get("batch_id") == batch_id
+        ))
+        walk = next(a for a in project["actions"] if a["id"] == "walk")
+        self.assertEqual(walk["revision"], 3)  # r1 整理 → r2 批次采用 → r3 方案发布
+        self.assertEqual(walk["variants"][0]["status"], "published")
+        round_trip = json.loads(json.dumps(project))
+        self.assertEqual(validate_project(round_trip), [])
 
 
 if __name__ == "__main__":

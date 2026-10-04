@@ -347,6 +347,7 @@ def validate_project(project: dict[str, Any]) -> list[str]:
         return errors
 
     action_ids: set[str] = set()
+    actions_by_id: dict[str, dict[str, Any]] = {}
     for action_index, action in enumerate(actions):
         prefix = f"第 {action_index + 1} 个整理动作"
         if not isinstance(action, dict):
@@ -359,6 +360,7 @@ def validate_project(project: dict[str, Any]) -> list[str]:
             errors.append(f"{prefix}id 重复：{action_id}")
         else:
             action_ids.add(action_id)
+            actions_by_id[action_id] = action
         action_duration = action.get("duration")
         if not isinstance(action_duration, (int, float)) or not math.isfinite(action_duration) or action_duration <= 0:
             errors.append(f"{prefix}的时长必须是正数")
@@ -409,6 +411,9 @@ def validate_project(project: dict[str, Any]) -> list[str]:
                     errors.append(f"{entry_prefix}的决定必须是 source 或 keep")
                 if entry.get("status", "active") not in ("active", "withdrawn"):
                     errors.append(f"{entry_prefix}的状态必须是 active 或 withdrawn")
+                entry_batch = entry.get("batch_id")
+                if entry_batch is not None and not isinstance(entry_batch, str):
+                    errors.append(f"{entry_prefix}的批次 id 必须是字符串")
                 entry_version = entry.get("source_version")
                 if not isinstance(entry_version, int) or entry_version < 1:
                     errors.append(f"{entry_prefix}缺少采用依据的源版本号")
@@ -449,6 +454,63 @@ def validate_project(project: dict[str, Any]) -> list[str]:
                     prefix=f"{variant_prefix}内",
                 ))
         errors.extend(validate_clip(action, action_duration, skeleton, prefix=prefix + "内"))
+
+    review_batches = project.get("review_batches", [])
+    if review_batches is None:
+        review_batches = []
+    if not isinstance(review_batches, list):
+        errors.append("审阅批次必须是数组")
+        return errors
+    batch_ids: set[str] = set()
+    for batch_index, batch in enumerate(review_batches):
+        batch_prefix = f"第 {batch_index + 1} 个审阅批次"
+        if not isinstance(batch, dict):
+            errors.append(f"{batch_prefix}必须是对象")
+            continue
+        batch_id = batch.get("id")
+        if not isinstance(batch_id, str) or not batch_id.strip():
+            errors.append(f"{batch_prefix}缺少有效 id")
+        elif batch_id in batch_ids:
+            errors.append(f"{batch_prefix}id 重复：{batch_id}")
+        else:
+            batch_ids.add(batch_id)
+        if not isinstance(batch.get("name"), str) or not batch["name"].strip():
+            errors.append(f"{batch_prefix}缺少名称")
+        if batch.get("status") not in ("open", "closed", "cancelled"):
+            errors.append(f"{batch_prefix}的状态必须是 open、closed 或 cancelled")
+        batch_source_version = batch.get("source_version")
+        if not isinstance(batch_source_version, int) or batch_source_version < 1:
+            errors.append(f"{batch_prefix}缺少所审阅的源版本号")
+        items = batch.get("items")
+        if not isinstance(items, list) or not items:
+            errors.append(f"{batch_prefix}至少需要一个审阅项")
+            continue
+        seen_items: set[tuple[str, str | None]] = set()
+        for item_index, item in enumerate(items):
+            item_prefix = f"{batch_prefix}第 {item_index + 1} 个审阅项"
+            if not isinstance(item, dict):
+                errors.append(f"{item_prefix}必须是对象")
+                continue
+            item_action_id = item.get("action_id")
+            item_variant_id = item.get("variant_id")
+            action = actions_by_id.get(item_action_id) if isinstance(item_action_id, str) else None
+            if action is None:
+                errors.append(f"{item_prefix}引用了未知整理动作 {item_action_id}")
+                continue
+            if item_variant_id is not None:
+                variant_ids = {v.get("id") for v in action.get("variants", []) or [] if isinstance(v, dict)}
+                if item_variant_id not in variant_ids:
+                    errors.append(f"{item_prefix}引用了未知方案 {item_variant_id}")
+            if (item_action_id, item_variant_id) in seen_items:
+                errors.append(f"{item_prefix}重复")
+            seen_items.add((item_action_id, item_variant_id))
+            if item.get("choice") not in ("pending", "keep", "source"):
+                errors.append(f"{item_prefix}的选择必须是 pending、keep 或 source")
+            if item.get("status") not in ("pending", "applied", "published"):
+                errors.append(f"{item_prefix}的状态必须是 pending、applied 或 published")
+            confirmed_version = item.get("confirmed_source_version")
+            if not isinstance(confirmed_version, int) or confirmed_version < 1:
+                errors.append(f"{item_prefix}缺少确认依据的源版本号")
 
     return errors
 
@@ -826,6 +888,7 @@ def apply_rebake(
     action_id: str,
     decisions: list[dict[str, Any]],
     variant_id: str | None = None,
+    batch_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply per-segment rebake decisions to one action; returns the new action.
 
@@ -842,7 +905,9 @@ def apply_rebake(
     instead of the action itself, so two adoption plans for the same source
     revision stay independently editable until one is published. Without
     variant_id the previous keyframes are snapshotted so older revisions remain
-    playable after save/reload.
+    playable after save/reload. batch_id tags the logged decisions with the
+    review batch they were confirmed in, so cancelling one batch only withdraws
+    its own unpublished decisions.
     """
     action = next((item for item in project.get("actions", []) if item.get("id") == action_id), None)
     if action is None:
@@ -930,6 +995,7 @@ def apply_rebake(
             "id": _next_decision_id({**action, "decision_log": decision_log}),
             "revision": target_revision,
             "variant_id": variant_id,
+            "batch_id": batch_id,
             "segment": {
                 "start": float(window.get("start", 0.0)),
                 "end": float(window.get("end", 0.0)),
@@ -1030,6 +1096,277 @@ def publish_variant(project: dict[str, Any], action_id: str, variant_id: str) ->
     if not analyze_rebake(project, updated):
         updated["source"]["source_version"] = int(project.get("version", 1))
     return updated
+
+
+def _find_review_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    batch = next(
+        (item for item in project.get("review_batches", []) or []
+         if isinstance(item, dict) and item.get("id") == batch_id),
+        None,
+    )
+    if batch is None:
+        raise ValueError(f"找不到审阅批次 {batch_id}")
+    return batch
+
+
+def _review_batches_copy(project: dict[str, Any]) -> list[dict[str, Any]]:
+    return deepcopy(project.get("review_batches", []) or [])
+
+
+def _batch_item_target(action: dict[str, Any], variant_id: str | None) -> dict[str, Any]:
+    """Return the (action, variant-or-None) pair one batch item reviews."""
+    if variant_id is None:
+        return action, None
+    variant = next(
+        (item for item in action.get("variants", []) or [] if item.get("id") == variant_id),
+        None,
+    )
+    if variant is None:
+        raise ValueError(f"找不到方案 {variant_id}")
+    return action, variant
+
+
+def create_review_batch(
+    project: dict[str, Any],
+    entries: list[dict[str, Any]],
+    name: str = "",
+    batch_id: str | None = None,
+) -> dict[str, Any]:
+    """Group actions/drafts affected by one source revision into a review batch.
+
+    Every entry is {"action_id", "variant_id?"}; variant_id=None reviews the
+    action itself, otherwise that draft variant. Each item starts as 待决定 and
+    records the source version it is reviewing, so a later source revision can
+    demand explicit re-confirmation.
+    """
+    batches = [item for item in project.get("review_batches", []) or [] if isinstance(item, dict)]
+    new_id = batch_id or f"batch-{len(batches) + 1}"
+    if any(item.get("id") == new_id for item in batches):
+        raise ValueError(f"审阅批次 id 重复：{new_id}")
+    items: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("审阅项必须是对象")
+        action_id = entry.get("action_id")
+        variant_id = entry.get("variant_id")
+        action = next((a for a in project.get("actions", []) if a.get("id") == action_id), None)
+        if action is None:
+            raise ValueError(f"找不到整理动作 {action_id}")
+        if (action_id, variant_id) in seen:
+            raise ValueError(f"审阅项重复：{action_id}/{variant_id or '当前动作'}")
+        seen.add((action_id, variant_id))
+        if variant_id is not None:
+            _, variant = _batch_item_target(action, str(variant_id))
+            if variant.get("status") != "draft":
+                raise ValueError(f"方案「{variant.get('name', variant_id)}」已发布，不能加入审阅批次")
+        items.append({
+            "action_id": str(action_id),
+            "variant_id": str(variant_id) if variant_id is not None else None,
+            "choice": "pending",
+            "confirmed_source_version": int(project.get("version", 1)),
+            "status": "pending",
+            "pre_keyframes": None,
+            "pre_revision": None,
+        })
+    if not items:
+        raise ValueError("审阅批次至少需要一个审阅项")
+    batches.append({
+        "id": new_id,
+        "name": name or f"审阅批次 {len(batches) + 1}",
+        "source_version": int(project.get("version", 1)),
+        "status": "open",
+        "created_at": _utc_now_iso(),
+        "items": items,
+    })
+    return {**project, "review_batches": batches}
+
+
+def set_review_choice(
+    project: dict[str, Any],
+    batch_id: str,
+    action_id: str,
+    variant_id: str | None,
+    choice: str,
+) -> dict[str, Any]:
+    """Mark one batch item 待决定/保留旧依据/采用新源 and re-stamp its basis."""
+    if choice not in ("pending", "keep", "source"):
+        raise ValueError(f"未知审阅选择 {choice}")
+    batches = _review_batches_copy(project)
+    batch = _find_review_batch({**project, "review_batches": batches}, batch_id)
+    if batch.get("status") != "open":
+        raise ValueError("批次已关闭或取消，不能再修改选择")
+    item = next(
+        (entry for entry in batch.get("items", [])
+         if entry.get("action_id") == action_id and entry.get("variant_id") == variant_id),
+        None,
+    )
+    if item is None:
+        raise ValueError(f"批次 {batch_id} 中没有 {action_id}/{variant_id or '当前动作'} 审阅项")
+    if item.get("status") != "pending":
+        raise ValueError("该审阅项已提交，不能再修改选择")
+    item["choice"] = choice
+    item["confirmed_source_version"] = int(project.get("version", 1))
+    return {**project, "review_batches": batches}
+
+
+def _review_item_view(project: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    action = next((a for a in project.get("actions", []) if a.get("id") == item.get("action_id")), None)
+    if action is None:
+        raise ValueError(f"找不到整理动作 {item.get('action_id')}")
+    _, variant = _batch_item_target(action, item.get("variant_id"))
+    target = variant if variant is not None else action
+    pseudo = {**action, "keyframes": target.get("keyframes", [])}
+    unhandled = analyze_rebake(project, pseudo)
+    published = (
+        item.get("status") == "published"
+        or (variant is not None and variant.get("status") == "published")
+        or (variant is None and item.get("status") == "applied")
+    )
+    current_revision = int(target.get("revision", 1))
+    choice = item.get("choice", "pending")
+    final_revision = current_revision + 1 if choice in ("keep", "source") and unhandled and not published else current_revision
+    return {
+        "action_id": item.get("action_id"),
+        "variant_id": item.get("variant_id"),
+        "action_name": action.get("name", item.get("action_id")),
+        "variant_name": variant.get("name") if variant is not None else None,
+        "choice": choice,
+        "status": item.get("status", "pending"),
+        "published": published,
+        "needs_reconfirm": (
+            not published
+            and item.get("status") == "pending"
+            and int(item.get("confirmed_source_version", 0)) != int(project.get("version", 1))
+        ),
+        "unhandled": unhandled,
+        "final_revision": final_revision,
+    }
+
+
+def review_batch_summary(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Pre-submit view: every item's final revision and still-unhandled ranges."""
+    batch = _find_review_batch(project, batch_id)
+    return {
+        "id": batch.get("id"),
+        "name": batch.get("name"),
+        "status": batch.get("status"),
+        "source_version": batch.get("source_version"),
+        "items": [_review_item_view(project, item) for item in batch.get("items", [])],
+    }
+
+
+def submit_review_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Apply every decided item in the batch; undecided items stay untouched.
+
+    Action-level items are published straight onto the action; variant items
+    only update their draft (publishing stays a per-variant decision, so drafts
+    sharing one source version are never published together). Items whose
+    choice was confirmed against an older source version must be explicitly
+    re-confirmed before they can be submitted.
+    """
+    batches = _review_batches_copy(project)
+    batch = _find_review_batch({**project, "review_batches": batches}, batch_id)
+    if batch.get("status") != "open":
+        raise ValueError("批次已关闭或取消，不能再提交")
+    ready = [
+        item for item in batch.get("items", [])
+        if item.get("status") == "pending" and item.get("choice") in ("keep", "source")
+    ]
+    if not ready:
+        raise ValueError("没有可提交的决定：各项仍为待决定或已处理")
+    stale = [
+        item for item in ready
+        if int(item.get("confirmed_source_version", 0)) != int(project.get("version", 1))
+    ]
+    if stale:
+        names = "、".join(
+            f"{item['action_id']}/{item.get('variant_id') or '当前动作'}" for item in stale
+        )
+        raise ValueError(f"源已再次修订，以下审阅项需重新确认：{names}")
+
+    actions = [deepcopy(action) for action in project.get("actions", [])]
+    working = {**project, "actions": actions}
+    applied = 0
+    for item in ready:
+        action = next(a for a in actions if a.get("id") == item["action_id"])
+        _, variant = _batch_item_target(action, item.get("variant_id"))
+        target = variant if variant is not None else action
+        pseudo = {**action, "keyframes": target.get("keyframes", [])}
+        segments = analyze_rebake(working, pseudo)
+        if not segments:
+            item["status"] = "published" if variant is None else "applied"
+            continue
+        item["pre_keyframes"] = deepcopy(target.get("keyframes", []))
+        item["pre_revision"] = int(target.get("revision", 1))
+        decisions = [
+            {
+                "segment": {"start": s["start"], "end": s["end"], "bones": s["bones"]},
+                "resolution": item["choice"],
+            }
+            for s in segments
+        ]
+        updated_action = apply_rebake(
+            working, item["action_id"], decisions, item.get("variant_id"), batch_id=batch_id,
+        )
+        actions[actions.index(action)] = updated_action
+        item["status"] = "published" if variant is None else "applied"
+        applied += 1
+    if all(item.get("status") != "pending" for item in batch.get("items", [])):
+        batch["status"] = "closed"
+        batch["closed_at"] = _utc_now_iso()
+    return {**working, "review_batches": batches}
+
+
+def cancel_review_batch(project: dict[str, Any], batch_id: str) -> dict[str, Any]:
+    """Withdraw only this batch's unpublished decisions.
+
+    Draft variants updated by the batch but never published are restored to
+    their pre-submit keyframes and the batch's decisions on them are marked
+    withdrawn. Published items (action-level applies and published variants),
+    other batches' results and unrelated manual rework are never touched.
+    """
+    batches = _review_batches_copy(project)
+    batch = _find_review_batch({**project, "review_batches": batches}, batch_id)
+    if batch.get("status") == "cancelled":
+        raise ValueError("批次已取消")
+    actions = [deepcopy(action) for action in project.get("actions", [])]
+    for item in batch.get("items", []):
+        action = next((a for a in actions if a.get("id") == item.get("action_id")), None)
+        if action is None:
+            continue
+        variant_id = item.get("variant_id")
+        variant = None
+        if variant_id is not None:
+            variant = next(
+                (v for v in action.get("variants", []) or [] if v.get("id") == variant_id),
+                None,
+            )
+        published = (
+            item.get("status") == "published"
+            or (variant is not None and variant.get("status") == "published")
+            or (variant_id is None and item.get("status") == "applied")
+        )
+        if published:
+            continue
+        if variant is not None and item.get("pre_keyframes") is not None:
+            variant["keyframes"] = deepcopy(item["pre_keyframes"])
+            variant["revision"] = int(item.get("pre_revision") or variant.get("revision", 1))
+        action["decision_log"] = [
+            {**entry, "status": "withdrawn"}
+            if entry.get("batch_id") == batch_id
+            and entry.get("variant_id") == variant_id
+            and entry.get("status", "active") == "active"
+            else entry
+            for entry in action.get("decision_log", []) or []
+        ]
+        item["status"] = "pending"
+        item["choice"] = "pending"
+        item["pre_keyframes"] = None
+        item["pre_revision"] = None
+    batch["status"] = "cancelled"
+    batch["closed_at"] = _utc_now_iso()
+    return {**project, "actions": actions, "review_batches": batches}
 
 
 def withdrawal_preview(project: dict[str, Any], action_id: str, decision_id: str) -> dict[str, Any]:
@@ -1189,6 +1526,7 @@ def migrate_project(project: dict[str, Any]) -> dict[str, Any]:
         return project
     project.setdefault("version", 1)
     project.setdefault("actions", [])
+    project.setdefault("review_batches", [])
     for layer in project.get("layers", []) or []:
         if isinstance(layer, dict):
             layer.setdefault("weight_keys", [])

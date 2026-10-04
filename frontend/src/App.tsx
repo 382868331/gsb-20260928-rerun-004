@@ -7,7 +7,9 @@ import {
   addWeightKey,
   addLayerKeyframe,
   bakeAction,
+  cancelReviewBatch,
   continuityReport,
+  createReviewBatch,
   createVariant,
   duplicateKeyframe,
   exportAction,
@@ -16,7 +18,10 @@ import {
   orderedKeyframes,
   publishVariant,
   removeWeightKey,
+  reviewBatchSummary,
   sampleFrames,
+  setReviewChoice,
+  submitReviewBatch,
   updateWeightKey,
   updateLayer,
   updateLayerPose,
@@ -31,6 +36,7 @@ import {
   type Action,
   type ActionVariant,
   type Project,
+  type ReviewChoice,
   type Transform,
   type WithdrawalPreview,
 } from "./animation";
@@ -138,6 +144,9 @@ export default function App() {
   const [previewRevision, setPreviewRevision] = useState<number | null>(null);
   const [selectedVariantId, setSelectedVariantId] = useState<string | null>(null);
   const [withdrawPreview, setWithdrawPreview] = useState<WithdrawalPreview | null>(null);
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
+  const [batchPicks, setBatchPicks] = useState<Record<string, boolean>>({});
+  const [batchName, setBatchName] = useState("");
   const frameRef = useRef<number | null>(null);
   const startRef = useRef({ wall: 0, animation: 0 });
 
@@ -183,12 +192,24 @@ export default function App() {
     keyframes: selectedVariant?.keyframes ?? previewKeyframes ?? activeAction.keyframes,
     layers: activeAction.layers ?? [],
   } : project), [project, activeAction, previewKeyframes, selectedVariant]);
-  const affectedActions = useMemo(
+ const affectedActions = useMemo(
     () => (project.actions ?? [])
       .map((action) => ({ action, segments: analyzeRebake(project, action) }))
       .filter((entry) => entry.segments.length > 0),
     [project],
   );
+  const selectedBatch = useMemo(
+    () => project.review_batches?.find((batch) => batch.id === selectedBatchId) ?? null,
+    [project.review_batches, selectedBatchId],
+  );
+  const batchSummary = useMemo(() => {
+    if (!selectedBatch) return null;
+    try {
+      return reviewBatchSummary(project, selectedBatch.id);
+    } catch {
+      return null;
+    }
+  }, [project, selectedBatch]);
   const sharedSourceKeys = useMemo(() => {
     const counts = new Map<string, number>();
     (project.actions ?? []).forEach((action) => {
@@ -524,6 +545,110 @@ export default function App() {
     }
   };
 
+  const commitBatch = (next: Project, notice: string) => {
+    if (validateProject(next).length > 0) {
+      setMessage("批次结果未通过校验，已放弃（工程未修改）。");
+      return false;
+    }
+    setHistory((items) => [...items.slice(-49), project]);
+    setProject(next);
+    setMessage(notice);
+    setReport(null);
+    return true;
+  };
+
+  const runCreateBatch = async () => {
+    const entries = Object.entries(batchPicks)
+      .filter(([, picked]) => picked)
+      .map(([key]) => {
+        const [actionId, variantId] = key.split("|");
+        return { action_id: actionId, variant_id: variantId || null };
+      });
+    if (entries.length === 0) {
+      setMessage("请先勾选要放入批次的动作或草稿。");
+      return;
+    }
+    try {
+      let next = createReviewBatch(project, entries, batchName);
+      try {
+        const verified = await api<{ project: Project }>("/api/review", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "create", entries, name: batchName }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地批次；保存前请启动后端核对。");
+      }
+      const createdId = next.review_batches?.at(-1)?.id ?? null;
+      if (commitBatch(next, "已新建审阅批次：" + entries.length + " 个审阅项，全部待决定；保存重开后选择与依据保持不变。")) {
+        setBatchPicks({});
+        setBatchName("");
+        setSelectedBatchId(createdId);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "新建批次失败");
+    }
+  };
+
+  const runBatchChoice = async (actionId: string, variantId: string | null, choice: ReviewChoice) => {
+    if (!selectedBatch) return;
+    try {
+      let next = setReviewChoice(project, selectedBatch.id, actionId, variantId, choice);
+      try {
+        const verified = await api<{ project: Project }>("/api/review", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "choice", batch_id: selectedBatch.id, action_id: actionId, variant_id: variantId, choice }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地选择；保存前请启动后端核对。");
+      }
+      commitBatch(next, "已记录选择（依据源 v" + project.version + "）；源再次修订后需重新确认。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "记录选择失败");
+    }
+  };
+
+  const runSubmitBatch = async () => {
+    if (!selectedBatch) return;
+    try {
+      let next = submitReviewBatch(project, selectedBatch.id);
+      try {
+        const verified = await api<{ project: Project }>("/api/review", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "submit", batch_id: selectedBatch.id }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地提交结果；保存前请启动后端核对。");
+      }
+      const decided = selectedBatch.items.filter((item) => item.status === "pending" && item.choice !== "pending").length;
+      const remaining = selectedBatch.items.length - decided;
+      commitBatch(next, "已提交 " + decided + " 项决定：动作项直接发布，方案项只写入草稿不随批次发布；其余 " + remaining + " 项保留为待决定。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "提交批次失败");
+    }
+  };
+
+  const runCancelBatch = async () => {
+    if (!selectedBatch) return;
+    try {
+      let next = cancelReviewBatch(project, selectedBatch.id);
+      try {
+        const verified = await api<{ project: Project }>("/api/review", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "cancel", batch_id: selectedBatch.id }),
+        });
+        next = verified.project;
+      } catch {
+        setMessage("Python 服务不可用，已使用本地取消结果；保存前请启动后端核对。");
+      }
+      commitBatch(next, "已取消批次：仅撤回本批未发布的决定，已发布项、其他批次与手工返修均不受影响。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "取消批次失败");
+    }
+  };
+
   return (
     <main className="app-shell">
       <header>
@@ -747,6 +872,71 @@ export default function App() {
           <button className="primary bake-btn" onClick={runBake}><Scissors size={15} />整理成新动作（保留源分层工程）</button>
         </div>}
       </section>
+      <section className="review-batch card">
+        <div className="card-title"><h2>批次审阅</h2><span>把一次源修订影响的多个动作与草稿放入同一批次分别决定；只发布已决定的项，其余草稿继续保留</span></div>
+        {(project.review_batches ?? []).length > 0 && <div className="action-tabs">
+          {(project.review_batches ?? []).map((batch) => <button key={batch.id}
+            className={selectedBatchId === batch.id ? "chip selected" : "chip"}
+            onClick={() => setSelectedBatchId(batch.id)}>
+            {batch.name}（{batch.status === "open" ? "审阅中" : batch.status === "closed" ? "已关闭" : "已取消"}）
+          </button>)}
+        </div>}
+        {affectedActions.length > 0 && <div className="batch-create">
+          <strong>源 v{project.version} 影响了 {affectedActions.length} 个动作，可勾选放入新批次：</strong>
+          {affectedActions.map(({ action, segments }) => <div key={action.id} className="batch-pick-row">
+            <span>{action.name}（{segments.length} 个受影响区间{sharedSourceKeys.has(action.id) ? "，共享源片段" : ""}）：</span>
+            <label>
+              <input type="checkbox" checked={!!batchPicks[action.id + "|"]}
+                onChange={(event) => setBatchPicks((prev) => ({ ...prev, [action.id + "|"]: event.target.checked }))} />
+              当前动作 r{action.revision ?? 1}
+            </label>
+            {(action.variants ?? []).filter((variant) => variant.status === "draft").map((variant) => <label key={variant.id}>
+              <input type="checkbox" checked={!!batchPicks[action.id + "|" + variant.id]}
+                onChange={(event) => setBatchPicks((prev) => ({ ...prev, [action.id + "|" + variant.id]: event.target.checked }))} />
+              {variant.name}（草稿 r{variant.revision}）
+            </label>)}
+          </div>)}
+          <div className="layer-controls">
+            <label>批次名称<input type="text" value={batchName} placeholder="如：v2 上身修订审阅" onChange={(event) => setBatchName(event.target.value)} /></label>
+            <button className="primary" onClick={runCreateBatch}>新建审阅批次</button>
+          </div>
+        </div>}
+        {selectedBatch && batchSummary && <div className="batch-detail">
+          <div className="card-title"><h3>{selectedBatch.name}（审阅源 v{selectedBatch.source_version}，当前源 v{project.version}）</h3><span>提交前列出每项的最终版本与仍未处理的范围；待决定项不会被发布</span></div>
+          {batchSummary.items.map((item) => {
+            const key = item.action_id + "|" + (item.variant_id ?? "");
+            const editable = selectedBatch.status === "open" && item.status === "pending";
+            return <div key={key} className={item.needs_reconfirm ? "batch-row warn" : "batch-row"}>
+              <div className="batch-row-head">
+                <strong>{item.action_name} · {item.variant_name ?? "当前动作"}</strong>
+                <span className="batch-status">
+                  {item.published ? "已发布" : item.status === "applied" ? "已写入草稿（未发布）" : item.choice === "pending" ? "待决定" : "已选择待提交"}
+                </span>
+              </div>
+              <div className="batch-row-body">
+                <span className="rebake-choice">
+                  <label><input type="radio" name={"batch-choice-" + key} disabled={!editable} checked={item.choice === "pending"} onChange={() => runBatchChoice(item.action_id, item.variant_id, "pending")} />待决定</label>
+                  <label><input type="radio" name={"batch-choice-" + key} disabled={!editable} checked={item.choice === "keep"} onChange={() => runBatchChoice(item.action_id, item.variant_id, "keep")} />保留旧依据</label>
+                  <label><input type="radio" name={"batch-choice-" + key} disabled={!editable} checked={item.choice === "source"} onChange={() => runBatchChoice(item.action_id, item.variant_id, "source")} />采用新源</label>
+                </span>
+                <span className="hint">
+                  {item.unhandled.length > 0
+                    ? "仍未处理 " + item.unhandled.length + " 段：" + item.unhandled.map((segment) => segment.start.toFixed(2) + "~" + segment.end.toFixed(2) + "s").join("、")
+                    : "没有未处理范围"}
+                  {"；最终版本 r"}{item.final_revision}
+                </span>
+                {item.needs_reconfirm && <span className="hint warn">源已变为 v{project.version}，该项选择依据旧源，提交前需重新确认。</span>}
+              </div>
+            </div>;
+          })}
+          {selectedBatch.status === "open" && <div className="batch-actions">
+            <button className="primary" onClick={runSubmitBatch}>提交已决定的项（其余保留草稿）</button>
+            <button onClick={runCancelBatch}>取消批次（只撤回本批未发布决定）</button>
+          </div>}
+          {selectedBatch.status !== "open" && <p className="hint">批次已{selectedBatch.status === "closed" ? "关闭" : "取消"}；未发布的草稿仍可在动作面板继续编辑或单独发布。</p>}
+        </div>}
+      </section>
+
 
       {!activeAction && project.layers && project.layers.length > 0 && (
         <section className="layers card">

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, continuityReport, createVariant, evaluateWorld, exportAction, layerEnvelope, migrateProject, publishVariant, removeWeightKey, sampleFrames, sampleLocal, shortestAngleDelta, updatePose, updateWeightKey, validateProject, weightKeyMultiplier, withdrawDecision, withdrawalPreview } from "./animation";
+import { addLayerKeyframe, addWeightKey, analyzeRebake, applyRebake, bakeAction, cancelReviewBatch, continuityReport, createReviewBatch, createVariant, evaluateWorld, exportAction, layerEnvelope, migrateProject, publishVariant, removeWeightKey, reviewBatchSummary, sampleFrames, sampleLocal, setReviewChoice, shortestAngleDelta, submitReviewBatch, updatePose, updateWeightKey, validateProject, weightKeyMultiplier, withdrawDecision, withdrawalPreview } from "./animation";
 import { defaultProject } from "./defaultProject";
 
 describe("animation core", () => {
@@ -386,5 +386,80 @@ describe("animation core", () => {
       expect(Math.abs(shortestAngleDelta(frame.pose.upper_arm_r.rotation, sourcePose.upper_arm_r.rotation))).toBeLessThan(1e-6);
     });
     expect(sampleFrames(updated.keyframes, 0.6).upper_arm_r).toBeDefined();
+  });
+
+  it("reviews a batch of shared actions and drafts with partial publish, reconfirm and cancel", () => {
+    const bones = defaultProject.skeleton.bones.map((bone) => bone.id);
+    const walk = { ...bakeAction(defaultProject, 0, 1.2, bones, "走路").action, id: "walk" };
+    const turn = { ...bakeAction(defaultProject, 0, 1.2, bones, "转身").action, id: "turn" };
+    let project: typeof defaultProject = { ...structuredClone(defaultProject), actions: [walk, turn] };
+    project = createVariant(project, "walk", "walk-A");
+    project = createVariant(project, "turn", "turn-A");
+    project.version = 2;
+    project.keyframes[1].pose.spine.rotation = 9;
+    const walkVar = project.actions![0].variants![0].id;
+    const turnVar = project.actions![1].variants![0].id;
+
+    project = createReviewBatch(project, [
+      { action_id: "walk", variant_id: null },
+      { action_id: "walk", variant_id: walkVar },
+      { action_id: "turn", variant_id: turnVar },
+    ], "v2 审阅");
+    const batchId = project.review_batches![0].id;
+    expect(validateProject(project)).toHaveLength(0);
+
+    // mid-review choices survive a save/reload round trip with their basis
+    project = setReviewChoice(project, batchId, "walk", null, "source");
+    project = setReviewChoice(project, batchId, "walk", walkVar, "keep");
+    project = migrateProject(JSON.parse(JSON.stringify(project)));
+    const items = project.review_batches![0].items;
+    expect(items.find((item) => item.action_id === "walk" && item.variant_id === null)?.choice).toBe("source");
+    expect(items.every((item) => item.confirmed_source_version === 2)).toBe(true);
+
+    // pre-submit summary lists final revision and unhandled ranges per item
+    const summary = reviewBatchSummary(project, batchId);
+    const walkView = summary.items.find((item) => item.action_id === "walk" && item.variant_id === null)!;
+    const turnView = summary.items.find((item) => item.action_id === "turn")!;
+    expect(walkView.unhandled.length).toBeGreaterThan(0);
+    expect(walkView.final_revision).toBe(2);
+    expect(turnView.final_revision).toBe(1);
+
+    // submit publishes only decided items; shared-source siblings stay pending
+    project = submitReviewBatch(project, batchId);
+    const walkAction = project.actions![0];
+    const turnAction = project.actions![1];
+    expect(walkAction.revision).toBe(2);
+    expect(analyzeRebake(project, walkAction)).toHaveLength(0);
+    expect(walkAction.variants![0].revision).toBe(2);
+    expect(walkAction.variants![0].status).toBe("draft");
+    expect(turnAction.revision).toBe(1);
+    expect(project.review_batches![0].status).toBe("open");
+    expect(walkAction.decision_log!.every((entry) => entry.batch_id === batchId && entry.source_version === 2)).toBe(true);
+
+    // an intersecting follow-up revision demands explicit re-confirmation
+    project.version = 3;
+    project.keyframes[1].pose.spine.rotation = 15;
+    const stale = reviewBatchSummary(project, batchId).items.find((item) => item.action_id === "turn")!;
+    expect(stale.needs_reconfirm).toBe(true);
+    project = setReviewChoice(project, batchId, "turn", turnVar, "source");
+    expect(() => submitReviewBatch(project, batchId)).not.toThrow();
+    project = submitReviewBatch(project, batchId);
+    expect(project.review_batches![0].status).toBe("closed");
+    expect(project.actions![1].variants![0].status).toBe("draft");
+
+    // cancelling a batch withdraws only its own unpublished decisions
+    project = createReviewBatch(project, [{ action_id: "turn", variant_id: turnVar }], "补充");
+    const batch2 = project.review_batches![1].id;
+    project = setReviewChoice(project, batch2, "turn", turnVar, "source");
+    const preDraft = structuredClone(project.actions![1].variants![0].keyframes);
+    project = submitReviewBatch(project, batch2);
+    expect(project.actions![1].variants![0].revision).toBe(2); // 与源一致时提交不再升修订
+    project = cancelReviewBatch(project, batch2);
+    const cancelled = project.actions![1];
+    expect(cancelled.variants![0].keyframes).toEqual(preDraft);
+    expect(cancelled.decision_log!.filter((entry) => entry.batch_id === batch2).every((entry) => entry.status === "withdrawn")).toBe(true);
+    expect(cancelled.decision_log!.filter((entry) => entry.batch_id === batchId).every((entry) => (entry.status ?? "active") === "active")).toBe(true);
+    expect(project.actions![0].revision).toBe(2);
+    expect(validateProject(project)).toHaveLength(0);
   });
 });
