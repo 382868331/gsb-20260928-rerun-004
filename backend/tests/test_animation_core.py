@@ -14,9 +14,11 @@ from animation_core import (
     default_project,
     evaluate_world,
     export_action,
+    joint_candidate_report,
     layer_envelope,
     load_project,
     migrate_project,
+    publish_joint_candidate,
     publish_variant,
     review_batch_summary,
     sample_local,
@@ -595,6 +597,143 @@ class AnimationCoreTests(unittest.TestCase):
             [frame for frame in walk_action["keyframes"] if frame.get("origin") == "manual"],
             kept,
         )
+
+    def test_joint_candidate_checks_seams_overlaps_and_publishes_only_approved_ranges(self):
+        project = default_project()
+        bone_ids = [bone["id"] for bone in project["skeleton"]["bones"]]
+        early = bake_action(project, 0.0, 0.6, bone_ids, "前半段", action_id="early")
+        late = bake_action(project, 0.6, 1.2, bone_ids, "后半段", action_id="late")
+        overlap = bake_action(project, 0.45, 0.75, bone_ids, "重叠段", action_id="overlap")
+        project["actions"] = [early, late, overlap]
+        project["version"] = 2
+        project["keyframes"][0]["pose"]["spine"]["rotation"] = 1.0
+        project["keyframes"][1]["pose"]["spine"]["rotation"] = 9.0
+        project["keyframes"][2]["pose"]["spine"]["rotation"] = 2.0
+
+        opened = create_review_batch(project, ["early", "late"], batch_id="joint-batch")
+        batch = opened["review_batches"][-1]
+        self.assertEqual([item["action_id"] for item in batch["items"]], ["early", "late"])
+        decisions_for = {
+            item["action_id"]: {str(index): "source" for index in range(len(item["segments"]))}
+            for item in batch["items"]
+        }
+        decided = opened
+        for action_id in ("early", "late"):
+            decided = set_review_item_decisions(decided, "joint-batch", action_id, decisions_for[action_id])
+        adjacent_selections = [
+            {"action_id": "early", "index": 0},
+            {"action_id": "late", "index": 0},
+        ]
+        report = joint_candidate_report(decided, "joint-batch", adjacent_selections)
+        self.assertTrue(report["ok"], report["errors"])
+        self.assertEqual(report["ranges"][0]["source_start"], 0.0)
+        self.assertEqual(report["ranges"][-1]["source_end"], 1.2)
+
+        # a separate candidate containing the time-overlapping action must not
+        # let submission order win: an incompatible overlap is explicit conflict
+        conflict_project = deepcopy(decided)
+        overlap_action = next(item for item in conflict_project["actions"] if item["id"] == "overlap")
+        overlap_action["keyframes"][3]["pose"]["spine"]["rotation"] = 72.0
+        overlap_action["keyframes"][3]["origin"] = "manual"
+        conflict_project["version"] = 3
+        conflict_project["keyframes"][1]["pose"]["spine"]["rotation"] = 12.0
+        conflict_opened = create_review_batch(
+            conflict_project, ["early", "overlap"], batch_id="conflict-batch",
+        )
+        conflict_batch = conflict_opened["review_batches"][-1]
+        for item in conflict_batch["items"]:
+            action = next(entry for entry in conflict_opened["actions"] if entry["id"] == item["action_id"])
+            choices = {
+                str(index): ("keep" if segment["manual"] else "source")
+                for index, segment in enumerate(item["segments"])
+            }
+            conflict_opened = set_review_item_decisions(
+                conflict_opened, "conflict-batch", item["action_id"], choices,
+            )
+        conflict_batch = review_batch_summary(conflict_opened, "conflict-batch")
+        overlap_item = next(item for item in conflict_batch["items"] if item["action_id"] == "overlap")
+        overlap_index = next(
+            index for index, segment in enumerate(overlap_item["segments"])
+            if any(bone == "spine" for bone in segment["bones"])
+        )
+        conflict_report = joint_candidate_report(conflict_opened, "conflict-batch", [
+            {"action_id": "early", "index": 0},
+            {"action_id": "overlap", "index": overlap_index},
+        ])
+        self.assertFalse(conflict_report["ok"])
+        self.assertTrue(any("重叠区间共享骨骼姿态冲突" in error for error in conflict_report["errors"]))
+
+        # publish only the adjacent approved ranges; overlap remains a draft and
+        # original published action revision is retained in previous_versions
+        published_result = publish_joint_candidate(decided, "joint-batch", adjacent_selections)
+        published_project = published_result["project"]
+        published_batch = published_result["batch"]
+        early_action = next(item for item in published_project["actions"] if item["id"] == "early")
+        late_action = next(item for item in published_project["actions"] if item["id"] == "late")
+        overlap_after = next(item for item in published_project["actions"] if item["id"] == "overlap")
+        self.assertEqual(early_action["revision"], 2)
+        self.assertEqual(late_action["revision"], 2)
+        self.assertEqual(overlap_after["revision"], 1)
+        self.assertEqual(len(early_action["previous_versions"]), 1)
+        self.assertTrue(any(segment.get("joint_published") for segment in published_batch["items"][0]["segments"]))
+
+        # playback and provenance: every published frame uses v2 source while
+        # the unpublished overlap draft and original action stay at v1/source diff
+        for frame in early_action["keyframes"]:
+            source_pose = sample_local(decided, frame["time"])
+            for bone_id in bone_ids:
+                self.assertLessEqual(
+                    abs(shortest_angle_delta(frame["pose"][bone_id]["rotation"], source_pose[bone_id]["rotation"])),
+                    1e-7,
+                )
+        for frame in late_action["keyframes"]:
+            source_pose = sample_local(decided, 0.6 + frame["time"])
+            for bone_id in bone_ids:
+                self.assertLessEqual(
+                    abs(shortest_angle_delta(frame["pose"][bone_id]["rotation"], source_pose[bone_id]["rotation"])),
+                    1e-7,
+                )
+        self.assertTrue(analyze_rebake(decided, overlap_after))
+        self.assertEqual(validate_project(json.loads(json.dumps(published_project))), [])
+
+        # a later source change exposes a new overlap candidate; the already
+        # partially published action and its original revision remain playable,
+        # while the new conflict stays a draft instead of winning by order
+        after_partial = deepcopy(published_project)
+        overlap_after_action = next(item for item in after_partial["actions"] if item["id"] == "overlap")
+        overlap_after_action["keyframes"][3]["pose"]["spine"]["rotation"] = 72.0
+        overlap_after_action["keyframes"][3]["origin"] = "manual"
+        after_partial["version"] = 3
+        after_partial["keyframes"][1]["pose"]["spine"]["rotation"] = 12.0
+        new_candidate = create_review_batch(
+            after_partial, ["early", "overlap"], batch_id="after-partial",
+        )
+        new_batch = new_candidate["review_batches"][-1]
+        for item in new_batch["items"]:
+            choices = {
+                str(index): ("keep" if segment["manual"] else "source")
+                for index, segment in enumerate(item["segments"])
+            }
+            new_candidate = set_review_item_decisions(
+                new_candidate, "after-partial", item["action_id"], choices,
+            )
+        new_batch = review_batch_summary(new_candidate, "after-partial")
+        new_overlap = next(item for item in new_batch["items"] if item["action_id"] == "overlap")
+        new_overlap_index = next(
+            index for index, segment in enumerate(new_overlap["segments"])
+            if any(bone == "spine" for bone in segment["bones"])
+        )
+        later_conflict = joint_candidate_report(new_candidate, "after-partial", [
+            {"action_id": "early", "index": 0},
+            {"action_id": "overlap", "index": new_overlap_index},
+        ])
+        self.assertFalse(later_conflict["ok"])
+        self.assertTrue(any("重叠区间共享骨骼姿态冲突" in error for error in later_conflict["errors"]))
+        early_published = next(item for item in new_candidate["actions"] if item["id"] == "early")
+        overlap_pending = next(item for item in new_candidate["actions"] if item["id"] == "overlap")
+        self.assertEqual(early_published["revision"], 2)
+        self.assertEqual(overlap_pending["revision"], 1)
+        self.assertEqual(len(early_published["previous_versions"]), 1)
 
 
 if __name__ == "__main__":

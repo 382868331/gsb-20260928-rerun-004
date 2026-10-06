@@ -30,6 +30,8 @@ import {
   withdrawalPreview,
   type Action,
   type ActionVariant,
+  type JointCandidateReport,
+  type JointSelection,
   type Project,
   type ReviewBatch,
   type ReviewItem,
@@ -40,6 +42,8 @@ import {
 import {
   cancelReviewItem,
   createReviewBatch,
+  jointCandidateReport,
+  publishJointCandidate,
   reviewBatchSummary,
   setReviewItemDecisions,
   submitReviewBatch,
@@ -128,20 +132,55 @@ function ComparePanel({ project, action, time, previewRevision }: {
   </div>;
 }
 
-function BatchReviewPanel({ batch, project, onDecide, onSubmit, onCancelItem, onOpenAction }: {
+function BatchReviewPanel({ batch, project, onDecide, onSubmit, onCancelItem, onOpenAction, onJointPublish }: {
   batch: ReviewBatch;
   project: Project;
   onDecide: (item: ReviewItem, resolutions: Record<number, ReviewSegment["resolution"]>) => void;
   onSubmit: () => void;
   onCancelItem: (item: ReviewItem) => void;
   onOpenAction: (actionId: string) => void;
+  onJointPublish: (selections: JointSelection[]) => Promise<void>;
 }) {
+  const [jointChecked, setJointChecked] = useState<Record<string, boolean>>({});
+  const [jointReport, setJointReport] = useState<JointCandidateReport | null>(null);
   const decidedCount = batch.items.filter((item) => item.status === "decided" || item.status === "published").length;
   const pendingItems = batch.items.filter((item) => item.status !== "published");
+  const jointSelections = batch.items.flatMap((item) => item.segments
+    .map((_, index) => ({ action_id: item.action_id, index }))
+    .filter((selection) => jointChecked[selection.action_id + ":" + selection.index]));
+  const jointKey = (selection: JointSelection) => selection.action_id + ":" + selection.index;
+  const runJointCheck = async () => {
+    try {
+      let report = jointCandidateReport(project, batch.id, jointSelections);
+      try {
+        const verified = await api<{ report: JointCandidateReport }>("/api/review-batch", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "joint-report", batch_id: batch.id, selections: jointSelections }),
+        });
+        report = verified.report;
+      } catch {
+        // Python unavailable: local report uses the same rules.
+      }
+      setJointReport(report);
+    } catch (error) {
+      setJointReport({
+        ok: false,
+        errors: [error instanceof Error ? error.message : "联合候选检查失败"],
+        ranges: [],
+        shared_bones: [],
+        dependency_closed: false,
+      });
+    }
+  };
+  const runJointPublish = async () => {
+    await onJointPublish(jointSelections);
+    setJointChecked({});
+    setJointReport(null);
+  };
   return <div className="batch-panel">
     <div className="card-title">
       <h3>{batch.name ?? batch.id}（源 v{batch.source_version}）</h3>
-      <span>已明确 {decidedCount}/{batch.items.length} 项；提交只发布决定完整的动作，未决定项及依据继续保存</span>
+      <span>已明确 {decidedCount}/{batch.items.length} 项；可跨动作勾选区间组成联合候选，只发布批准的闭合范围</span>
     </div>
     {batch.items.map((item) => {
       const action = project.actions?.find((entry) => entry.id === item.action_id);
@@ -163,10 +202,20 @@ function BatchReviewPanel({ batch, project, onDecide, onSubmit, onCancelItem, on
             <button onClick={() => onCancelItem(item)}>取消未发布决定</button>
           </>}
         </div>
-        {item.status !== "published" && item.segments.map((segment, index) => <div key={index} className="batch-segment">
+        {item.status !== "published" && item.segments.map((segment, index) => {
+          const selection = { action_id: item.action_id, index };
+          return <div key={index} className="batch-segment">
           <label>
+            <input type="checkbox"
+              checked={!!jointChecked[jointKey(selection)]}
+              disabled={segment.resolution === "pending" || !!segment.joint_published}
+              onChange={(event) => {
+                setJointChecked((prev) => ({ ...prev, [jointKey(selection)]: event.target.checked }));
+                setJointReport(null);
+              }} />
             {segment.start.toFixed(2)}~{segment.end.toFixed(2)}s · {segment.bones.join("、")}
             {segment.resolved && <em>（已应用，不再与源有差异）</em>}
+            {segment.joint_published && <em>（已作为联合范围发布）</em>}
           </label>
           {segment.basis && segment.basis.length > 0 && <span className="basis">
             依据：{segment.basis.map((entry) =>
@@ -187,9 +236,27 @@ function BatchReviewPanel({ batch, project, onDecide, onSubmit, onCancelItem, on
               {value === "source" ? "采用新源" : value === "keep" ? "保留旧依据" : "继续待定"}
             </label>)}
           </span>
-        </div>)}
+        </div>;
+        })}
       </div>;
     })}
+    <div className="joint-candidate">
+      <strong>跨动作共享骨骼协调</strong>
+      <span className="hint">相邻区间检查接缝姿态/根位移；重叠区间必须姿态一致。未勾中的依赖区间会导致候选不闭合，冲突必须明确选择或继续待定。</span>
+      <button onClick={runJointCheck} disabled={jointSelections.length === 0}>检查联合候选</button>
+      <button className="primary" onClick={runJointPublish} disabled={!jointReport?.ok}>批准并发布所选范围</button>
+      {jointReport && <div className={jointReport.ok ? "report ok" : "report warn"}>
+        {jointReport.ok
+          ? "可共同采用 " + jointReport.ranges.length + " 段；共享骨骼：" + jointReport.shared_bones.join("、")
+          : jointReport.errors.join("；")}
+      </div>}
+      {jointReport?.ok && <div className="basis">
+        {jointReport.ranges.map((range) => <span key={range.action_id + ":" + range.index}>
+          {range.action_name}：源 {range.source_start.toFixed(2)}~{range.source_end.toFixed(2)}s
+          （本动作 {range.local_start.toFixed(2)}~{range.local_end.toFixed(2)}s，依据 v{range.source_basis_version}，{range.resolution === "source" ? "采用新源" : "保留旧依据"}）
+        </span>)}
+      </div>}
+    </div>
     <div className="batch-actions">
       <button className="primary bake-btn" onClick={onSubmit} disabled={!batch.items.some((item) => item.status === "decided")}>
         提交批次（只发布明确决定项）
@@ -721,6 +788,32 @@ export default function App() {
     }
   };
 
+  const runJointPublish = async (batchId: string, selections: JointSelection[]) => {
+    try {
+      let next = publishJointCandidate(project, batchId, selections).project;
+      try {
+        const verified = await api<{ project: Project }>("/api/review-batch", {
+          method: "POST",
+          body: JSON.stringify({ project, op: "joint-publish", batch_id: batchId, selections }),
+        });
+        next = verified.project;
+      } catch {
+        // Backend unavailable: local result is produced from the same rules.
+      }
+      if (await applyBatchProject(next)) {
+        const batchAfter = next.review_batches?.find((item) => item.id === batchId);
+        const publishedActions = new Set(selections.map((selection) => selection.action_id));
+        setReport({
+          ok: true,
+          message: "已发布用户批准的联合闭合范围，涉及 " + publishedActions.size + " 个动作；其余草稿和原发布修订均保留。",
+        });
+        setMessage("联合范围已部分发布：" + (batchAfter?.id ?? batchId));
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "联合候选发布失败");
+    }
+  };
+
   return (
     <main className="app-shell">
       <header>
@@ -851,6 +944,7 @@ export default function App() {
                   onSubmit={runBatchSubmit}
                   onCancelItem={runBatchCancelItem}
                   onOpenAction={(actionId) => switchAction(actionId)}
+                  onJointPublish={(selections) => runJointPublish(batch.id, selections)}
                 />}
               </div>;
             })}

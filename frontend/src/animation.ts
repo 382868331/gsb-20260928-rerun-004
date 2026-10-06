@@ -86,6 +86,7 @@ export type ReviewSegment = {
   basis?: DecisionBasis[];
   resolution: "source" | "keep" | "pending";
   resolved?: boolean;
+  joint_published?: boolean;
 };
 export type ReviewItem = {
   action_id: string;
@@ -821,13 +822,20 @@ const refreshBatchItem = (project: Project, item: ReviewItem) => {
     const key = segmentKey(segment);
     seen.add(key);
     const decided = prior.get(key);
-    return { ...segment, basis: segment.basis, resolution: decided?.resolution ?? "pending", resolved: false };
+    return {
+      ...segment,
+      basis: segment.basis,
+      resolution: decided?.resolution ?? "pending",
+      resolved: false,
+      joint_published: decided?.joint_published ?? false,
+    };
   });
   prior.forEach((decided, key) => {
     if (!seen.has(key)) {
       segments.push({
         start: decided.start, end: decided.end, bones: decided.bones, manual: decided.manual,
         basis: decided.basis, resolution: decided.resolution, resolved: true,
+        joint_published: decided.joint_published ?? false,
       });
     }
   });
@@ -1003,6 +1011,237 @@ export function cancelReviewItem(project: Project, batchId: string, actionId: st
   item.status = "open";
   refreshBatch(next, batch);
   return next;
+}
+
+export type JointSelection = { action_id: string; index: number };
+export type JointCandidateReport = {
+  ok: boolean;
+  errors: string[];
+  ranges: {
+    action_id: string;
+    action_name: string;
+    index: number;
+    source_start: number;
+    source_end: number;
+    local_start: number;
+    local_end: number;
+    bones: string[];
+    resolution: "source" | "keep";
+    source_basis_version: number;
+  }[];
+  shared_bones: string[];
+  dependency_closed: boolean;
+};
+
+const getJointEntries = (project: Project, batch: ReviewBatch, selections: JointSelection[]) => {
+  const entries: {
+    action: Action;
+    item: ReviewItem;
+    variant: ActionVariant;
+    segment: ReviewSegment;
+    index: number;
+  }[] = [];
+  const seen = new Set<string>();
+  selections.forEach((selection) => {
+    const key = selection.action_id + ":" + selection.index;
+    if (seen.has(key)) return;
+    const item = batch.items.find((entry) => entry.action_id === selection.action_id);
+    const action = project.actions?.find((entry) => entry.id === selection.action_id);
+    if (!item || !action || selection.index < 0 || selection.index >= item.segments.length) {
+      throw new Error("联合候选包含无效区间：" + selection.action_id + "#" + selection.index);
+    }
+    const segment = item.segments[selection.index];
+    if (segment.resolution === "pending") {
+      throw new Error(action.name + " 的 " + segment.start + "~" + segment.end + "s 仍待定，不能进入联合候选");
+    }
+    const variant = action.variants?.find((entry) => entry.id === item.variant_id);
+    if (!variant) throw new Error("找不到动作 " + selection.action_id + " 的批次草稿");
+    entries.push({ action, item, variant, segment, index: selection.index });
+    seen.add(key);
+  });
+  if (entries.length === 0) throw new Error("请先勾选要组成联合候选的时间区间");
+  return entries;
+};
+
+const jointSourceWindow = (entry: ReturnType<typeof getJointEntries>[number]) => ({
+  start: entry.action.source.range_start + entry.segment.start,
+  end: entry.action.source.range_start + entry.segment.end,
+  bones: [...entry.segment.bones],
+});
+
+const jointBasisVersion = (entry: ReturnType<typeof getJointEntries>[number]) => {
+  const decision = [...(entry.action.decision_log ?? [])].reverse().find((item) =>
+    item.variant_id === entry.item.variant_id
+    && (item.status ?? "active") === "active"
+    && segmentsIntersect(entry.segment, item.segment));
+  return decision?.source_version ?? entry.action.source.source_version;
+};
+
+export function jointCandidateReport(project: Project, batchId: string, selections: JointSelection[]): JointCandidateReport {
+  const batch = reviewBatchSummary(project, batchId);
+  const entries = getJointEntries(project, batch, selections);
+  const windows = entries.map(jointSourceWindow);
+  const errors: string[] = [];
+  if (new Set(entries.map(jointBasisVersion)).size > 1) {
+    errors.push("联合候选中的决定依据了不同源修订，请先统一到同一源修订或保持旧修订范围待定");
+  }
+  const selectedKeys = new Set(entries.map((entry) => entry.item.action_id + ":" + entry.index));
+
+  batch.items.forEach((item) => {
+    const action = project.actions?.find((entry) => entry.id === item.action_id);
+    if (!action) return;
+    item.segments.forEach((segment, index) => {
+      const candidate = {
+        start: action.source.range_start + segment.start,
+        end: action.source.range_start + segment.end,
+        bones: segment.bones,
+      };
+      entries.forEach((entry, entryIndex) => {
+        if (entry.item.action_id === item.action_id && index === entry.index) return;
+        if (segmentsIntersect(candidate, windows[entryIndex])
+            && !selectedKeys.has(item.action_id + ":" + index)) {
+          errors.push("依赖未闭合：" + action.name + " " + segment.start + "~" + segment.end + "s 与已选区间在共享骨骼上相交");
+        }
+      });
+    });
+  });
+
+  const rootId = project.skeleton.bones.find((bone) => bone.parent === null)?.id ?? "root";
+  const poseAt = (entry: ReturnType<typeof getJointEntries>[number], sourceTime: number) => {
+    const localTime = Math.min(
+      Math.max(sourceTime - entry.action.source.range_start, 0),
+      entry.action.duration,
+    );
+    return sampleFrames(entry.variant.keyframes, localTime);
+  };
+  entries.forEach((first, index) => {
+    for (let otherIndex = index + 1; otherIndex < entries.length; otherIndex += 1) {
+      const second = entries[otherIndex];
+      const firstWindow = windows[index];
+      const secondWindow = windows[otherIndex];
+      const sharedBones = firstWindow.bones.filter((boneId) => secondWindow.bones.includes(boneId)).sort();
+      const overlapStart = Math.max(firstWindow.start, secondWindow.start);
+      const overlapEnd = Math.min(firstWindow.end, secondWindow.end);
+      if (sharedBones.length === 0) continue;
+      const touching = Math.abs(firstWindow.end - secondWindow.start) <= 1e-7
+        || Math.abs(secondWindow.end - firstWindow.start) <= 1e-7;
+      if (touching) {
+        const seamTime = Math.abs(firstWindow.end - secondWindow.start) <= 1e-7
+          ? secondWindow.start
+          : firstWindow.start;
+        const firstPose = poseAt(first, seamTime);
+        const secondPose = poseAt(second, seamTime);
+        sharedBones.forEach((boneId) => {
+          if (firstPose[boneId] && secondPose[boneId] && transformDiffers(firstPose[boneId], secondPose[boneId], 1e-6)) {
+            errors.push("跨区间接缝 " + seamTime + "s 的共享骨骼 " + boneId + " 姿态不连续");
+          }
+        });
+        const beforePose = poseAt(first, seamTime - 1 / first.action.source.fps);
+        const afterPose = poseAt(second, seamTime + 1 / second.action.source.fps);
+        if (firstPose[rootId] && secondPose[rootId] && beforePose[rootId] && afterPose[rootId]) {
+          const beforeDelta = Math.hypot(
+            firstPose[rootId].x - beforePose[rootId].x,
+            firstPose[rootId].y - beforePose[rootId].y,
+          );
+          const afterDelta = Math.hypot(
+            afterPose[rootId].x - secondPose[rootId].x,
+            afterPose[rootId].y - secondPose[rootId].y,
+          );
+          if (Math.abs(beforeDelta - afterDelta) > 1e-5) errors.push("跨区间接缝 " + seamTime + "s 的根运动速度不连续");
+          if (Math.abs(firstPose[rootId].x - secondPose[rootId].x) > 1e-6
+              || Math.abs(firstPose[rootId].y - secondPose[rootId].y) > 1e-6) {
+            errors.push("跨区间接缝 " + seamTime + "s 的根位移不连续");
+          }
+        }
+      } else if (overlapStart <= overlapEnd + 1e-9) {
+        const poseConflicts: string[] = [];
+        const rootConflicts: string[] = [];
+        [overlapStart, overlapEnd, (overlapStart + overlapEnd) / 2].forEach((sampleTime) => {
+          const firstPose = poseAt(first, sampleTime);
+          const secondPose = poseAt(second, sampleTime);
+          sharedBones.forEach((boneId) => {
+            if (firstPose[boneId] && secondPose[boneId] && transformDiffers(firstPose[boneId], secondPose[boneId], 1e-6)) {
+              poseConflicts.push(boneId + "@" + sampleTime.toFixed(3) + "s");
+            }
+          });
+          if (firstPose[rootId] && secondPose[rootId] && (
+            Math.abs(firstPose[rootId].x - secondPose[rootId].x) > 1e-6
+            || Math.abs(firstPose[rootId].y - secondPose[rootId].y) > 1e-6
+          )) {
+            rootConflicts.push("根位移@" + sampleTime.toFixed(3) + "s");
+          }
+        });
+        if (poseConflicts.length) errors.push("重叠区间共享骨骼姿态冲突，必须明确只选其一或保持待定：" + [...new Set(poseConflicts)].slice(0, 8).join("、"));
+        if (rootConflicts.length) errors.push("重叠区间根运动约束不一致：" + [...new Set(rootConflicts)].slice(0, 8).join("、"));
+      }
+    }
+  });
+
+  const ranges = entries.map((entry, index) => ({
+    action_id: entry.item.action_id,
+    action_name: entry.action.name,
+    index: entry.index,
+    source_start: windows[index].start,
+    source_end: windows[index].end,
+    local_start: entry.segment.start,
+    local_end: entry.segment.end,
+    bones: entry.segment.bones,
+    resolution: entry.segment.resolution as "source" | "keep",
+    source_basis_version: jointBasisVersion(entry),
+  })).sort((a, b) => a.source_start - b.source_start || a.source_end - b.source_end || a.action_id.localeCompare(b.action_id));
+  return {
+    ok: errors.length === 0,
+    errors,
+    ranges,
+    shared_bones: [...new Set(windows.flatMap((window) => window.bones))].sort(),
+    dependency_closed: errors.length === 0,
+  };
+}
+
+export function publishJointCandidate(project: Project, batchId: string, selections: JointSelection[]): {
+  project: Project;
+  batch: ReviewBatch;
+  report: JointCandidateReport;
+} {
+  const report = jointCandidateReport(project, batchId, selections);
+  if (!report.ok) throw new Error(report.errors.join("；"));
+  let next = cloneProject(project);
+  const groups = new Map<string, number[]>();
+  selections.forEach((selection) => {
+    const indexes = groups.get(selection.action_id) ?? [];
+    indexes.push(selection.index);
+    groups.set(selection.action_id, indexes);
+  });
+  groups.forEach((indexes, actionId) => {
+    const currentBatch = reviewBatchSummary(next, batchId);
+    const item = currentBatch.items.find((entry) => entry.action_id === actionId);
+    if (!item) return;
+    const decisions = indexes.map((index) => {
+      const segment = item.segments[index];
+      return {
+        segment: { start: segment.start, end: segment.end, bones: segment.bones },
+        resolution: segment.resolution as "source" | "keep",
+      };
+    });
+    next = applyRebake(next, actionId, decisions, null, batchId);
+  });
+  const storedBatch = next.review_batches?.find((batch) => batch.id === batchId);
+  const refreshed = reviewBatchSummary(next, batchId);
+  if (storedBatch) {
+    refreshed.items.forEach((freshItem) => {
+      const storedItem = storedBatch.items.find((item) => item.action_id === freshItem.action_id);
+      freshItem.segments.forEach((segment, index) => {
+        const selected = groups.get(freshItem.action_id)?.includes(index);
+        if (selected || storedItem?.segments[index]?.joint_published) {
+          segment.joint_published = true;
+          segment.resolved = true;
+        }
+      });
+    });
+    storedBatch.items = refreshed.items;
+    storedBatch.status = refreshed.status;
+  }
+  return { project: next, batch: reviewBatchSummary(next, batchId), report };
 }
 
 const poseDelta = (a: Record<string, Transform>, b: Record<string, Transform>, bones: string[]) =>

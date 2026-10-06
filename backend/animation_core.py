@@ -1255,6 +1255,7 @@ def _refresh_batch_item(project: dict[str, Any], item: dict[str, Any]) -> None:
             "basis": segment.get("basis", []),
             "resolution": decided["resolution"] if decided is not None else "pending",
             "resolved": False,
+            "joint_published": bool(decided and decided.get("joint_published")) if decided is not None else False,
         })
     for key, decided in prior.items():
         if key in seen_keys:
@@ -1267,6 +1268,7 @@ def _refresh_batch_item(project: dict[str, Any], item: dict[str, Any]) -> None:
             "basis": decided.get("basis", []),
             "resolution": decided["resolution"],
             "resolved": True,
+            "joint_published": bool(decided.get("joint_published")),
         })
     segments.sort(key=lambda segment: (float(segment["start"]), float(segment["end"])))
     item["segments"] = segments
@@ -1517,6 +1519,252 @@ def cancel_review_item(
     item["status"] = "open"
     _refresh_batch(updated, batch)
     return updated
+
+
+def _selected_joint_segments(
+    project: dict[str, Any],
+    batch: dict[str, Any],
+    selections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for selection in selections or []:
+        if not isinstance(selection, dict):
+            continue
+        action_id = str(selection.get("action_id", ""))
+        try:
+            index = int(selection.get("index"))
+        except (TypeError, ValueError):
+            continue
+        key = (action_id, index)
+        if key in seen:
+            continue
+        item = next((entry for entry in batch.get("items", []) if entry.get("action_id") == action_id), None)
+        action = next((entry for entry in project.get("actions", []) or [] if entry.get("id") == action_id), None)
+        if item is None or action is None or index < 0 or index >= len(item.get("segments", []) or []):
+            raise ValueError(f"联合候选包含无效区间：{action_id}#{index}")
+        segment = item["segments"][index]
+        if segment.get("resolution") not in ("source", "keep"):
+            raise ValueError(f"{action.name} 的 {segment.get('start', 0):g}~{segment.get('end', 0):g}s 仍待定，不能进入联合候选")
+        variant = next(
+            (entry for entry in action.get("variants", []) or [] if entry.get("id") == item.get("variant_id")),
+            None,
+        )
+        if variant is None:
+            raise ValueError(f"找不到动作 {action_id} 的批次草稿")
+        selected.append({
+            "action_id": action_id,
+            "action": action,
+            "item": item,
+            "variant": variant,
+            "segment": segment,
+            "index": index,
+        })
+        seen.add(key)
+    if not selected:
+        raise ValueError("请先勾选要组成联合候选的时间区间")
+    return selected
+
+
+def _source_window(entry: dict[str, Any]) -> dict[str, Any]:
+    source = entry["action"].get("source", {})
+    offset = float(source.get("range_start", 0.0))
+    segment = entry["segment"]
+    return {
+        "start": offset + float(segment["start"]),
+        "end": offset + float(segment["end"]),
+        "bones": list(segment.get("bones", [])),
+    }
+
+
+def _joint_source_basis(entry: dict[str, Any]) -> int:
+    segment = entry["segment"]
+    variant_id = entry["item"].get("variant_id")
+    for decision in reversed(entry["action"].get("decision_log", []) or []):
+        if decision.get("variant_id") != variant_id or decision.get("status", "active") != "active":
+            continue
+        if _segments_intersect(segment, decision.get("segment") or {}):
+            return int(decision.get("source_version", entry["action"].get("source", {}).get("source_version", 1)))
+    return int(entry["action"].get("source", {}).get("source_version", 1))
+
+
+def joint_candidate_report(
+    project: dict[str, Any],
+    batch_id: str,
+    selections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate a dependency-closed cross-action candidate without changing it."""
+    batch = review_batch_summary(project, batch_id)
+    entries = _selected_joint_segments(project, batch, selections)
+    errors: list[str] = []
+    windows = [_source_window(entry) for entry in entries]
+    basis_versions = {_joint_source_basis(entry) for entry in entries}
+    if len(basis_versions) > 1:
+        errors.append("联合候选中的决定依据了不同源修订，请先统一到同一源修订或保持旧修订范围待定")
+    selected_keys = {
+        (entry["action_id"], entry["index"])
+        for entry in entries
+    }
+
+    for item in batch.get("items", []):
+        action = next((entry for entry in project.get("actions", []) or [] if entry.get("id") == item.get("action_id")), None)
+        if action is None:
+            continue
+        offset = float(action.get("source", {}).get("range_start", 0.0))
+        for index, segment in enumerate(item.get("segments", []) or []):
+            candidate_window = {
+                "start": offset + float(segment.get("start", 0.0)),
+                "end": offset + float(segment.get("end", 0.0)),
+                "bones": segment.get("bones", []),
+            }
+            for entry, window in zip(entries, windows):
+                if entry["action_id"] == action.get("id") and index == entry["index"]:
+                    continue
+                if _segments_intersect(candidate_window, window):
+                    key = (str(item.get("action_id")), index)
+                    if key not in selected_keys:
+                        errors.append(
+                            f"依赖未闭合：{action.get('name', item.get('action_id'))} "
+                            f"{segment.get('start', 0):g}~{segment.get('end', 0):g}s 与已选区间在共享骨骼上相交"
+                        )
+
+    root_id = next(
+        (bone.get("id") for bone in project.get("skeleton", {}).get("bones", []) if bone.get("parent") is None),
+        "root",
+    )
+    for index, first in enumerate(entries):
+        first_window = windows[index]
+        for second_index in range(index + 1, len(entries)):
+            second = entries[second_index]
+            second_window = windows[second_index]
+            shared_bones = sorted(set(first_window["bones"]) & set(second_window["bones"]))
+            overlap_start = max(first_window["start"], second_window["start"])
+            overlap_end = min(first_window["end"], second_window["end"])
+            if not shared_bones:
+                continue
+
+            def pose_at(candidate: dict[str, Any], source_time: float) -> dict[str, dict[str, float]]:
+                source = candidate["action"].get("source", {})
+                local_time = source_time - float(source.get("range_start", 0.0))
+                local_time = min(max(local_time, 0.0), float(candidate["action"]["duration"]))
+                return sample_frames(candidate["variant"].get("keyframes", []), local_time)
+
+            touching = (
+                abs(first_window["end"] - second_window["start"]) <= 1e-7
+                or abs(second_window["end"] - first_window["start"]) <= 1e-7
+            )
+            if touching:
+                seam_time = (
+                    second_window["start"]
+                    if abs(first_window["end"] - second_window["start"]) <= 1e-7
+                    else first_window["start"]
+                )
+                first_pose = pose_at(first, seam_time)
+                second_pose = pose_at(second, seam_time)
+                for bone_id in shared_bones:
+                    if bone_id in first_pose and bone_id in second_pose and _transform_differs(first_pose[bone_id], second_pose[bone_id], 1e-6):
+                        errors.append(f"跨区间接缝 {seam_time:g}s 的共享骨骼 {bone_id} 姿态不连续")
+                first_fps = float(first["action"].get("source", {}).get("fps", 60.0))
+                second_fps = float(second["action"].get("source", {}).get("fps", 60.0))
+                before_pose = pose_at(first, seam_time - 1.0 / first_fps)
+                after_pose = pose_at(second, seam_time + 1.0 / second_fps)
+                if root_id in first_pose and root_id in second_pose and root_id in before_pose and root_id in after_pose:
+                    before_delta = math.hypot(
+                        first_pose[root_id]["x"] - before_pose[root_id]["x"],
+                        first_pose[root_id]["y"] - before_pose[root_id]["y"],
+                    )
+                    after_delta = math.hypot(
+                        after_pose[root_id]["x"] - second_pose[root_id]["x"],
+                        after_pose[root_id]["y"] - second_pose[root_id]["y"],
+                    )
+                    if abs(before_delta - after_delta) > 1e-5:
+                        errors.append(f"跨区间接缝 {seam_time:g}s 的根运动速度不连续")
+                    if abs(first_pose[root_id]["x"] - second_pose[root_id]["x"]) > 1e-6 \
+                            or abs(first_pose[root_id]["y"] - second_pose[root_id]["y"]) > 1e-6:
+                        errors.append(f"跨区间接缝 {seam_time:g}s 的根位移不连续")
+            elif overlap_start <= overlap_end + 1e-9:
+                sample_times = [overlap_start, overlap_end, (overlap_start + overlap_end) / 2.0]
+                pose_conflicts: list[str] = []
+                root_conflicts: list[str] = []
+                for sample_time in sample_times:
+                    first_pose = pose_at(first, sample_time)
+                    second_pose = pose_at(second, sample_time)
+                    for bone_id in shared_bones:
+                        if bone_id in first_pose and bone_id in second_pose and _transform_differs(first_pose[bone_id], second_pose[bone_id], 1e-6):
+                            pose_conflicts.append(f"{bone_id}@{sample_time:.3g}s")
+                    if root_id in first_pose and root_id in second_pose and (
+                        abs(first_pose[root_id]["x"] - second_pose[root_id]["x"]) > 1e-6
+                        or abs(first_pose[root_id]["y"] - second_pose[root_id]["y"]) > 1e-6
+                    ):
+                        root_conflicts.append(f"根位移@{sample_time:.3g}s")
+                if pose_conflicts:
+                    errors.append("重叠区间共享骨骼姿态冲突，必须明确只选其一或保持待定：" + "、".join(sorted(set(pose_conflicts))[:8]))
+                if root_conflicts:
+                    errors.append("重叠区间根运动约束不一致：" + "、".join(sorted(set(root_conflicts))[:8]))
+    ranges = []
+    for entry, window in zip(entries, windows):
+        ranges.append({
+            "action_id": entry["action_id"],
+            "action_name": entry["action"].get("name", entry["action_id"]),
+            "index": entry["index"],
+            "source_start": window["start"],
+            "source_end": window["end"],
+            "local_start": entry["segment"]["start"],
+            "local_end": entry["segment"]["end"],
+            "bones": window["bones"],
+            "resolution": entry["segment"]["resolution"],
+            "source_basis_version": _joint_source_basis(entry),
+        })
+    ranges.sort(key=lambda item: (item["source_start"], item["source_end"], item["action_id"]))
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "ranges": ranges,
+        "shared_bones": sorted({bone for window in windows for bone in window["bones"]}),
+        "dependency_closed": not errors,
+    }
+
+
+def publish_joint_candidate(
+    project: dict[str, Any],
+    batch_id: str,
+    selections: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Publish only the approved dependency-closed selected joint ranges."""
+    report = joint_candidate_report(project, batch_id, selections)
+    if not report["ok"]:
+        raise ValueError("；".join(report["errors"]))
+    updated = deepcopy(project)
+    batch = _get_batch(updated, batch_id)
+    _refresh_batch(updated, batch)
+    entries = _selected_joint_segments(updated, batch, selections)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        grouped.setdefault(entry["action_id"], []).append(entry)
+    for action_id, action_entries in grouped.items():
+        decisions = [
+            {
+                "segment": {
+                    "start": entry["segment"]["start"],
+                    "end": entry["segment"]["end"],
+                    "bones": entry["segment"].get("bones", []),
+                },
+                "resolution": entry["segment"]["resolution"],
+            }
+            for entry in sorted(action_entries, key=lambda item: item["index"])
+        ]
+        updated_action = apply_rebake(updated, action_id, decisions, None, batch_id=batch_id)
+        updated["actions"] = [
+            updated_action if item.get("id") == action_id else item
+            for item in updated.get("actions", [])
+        ]
+        item = next(entry for entry in batch["items"] if entry.get("action_id") == action_id)
+        published_indices = {entry["index"] for entry in action_entries}
+        for index, segment in enumerate(item.get("segments", []) or []):
+            if index in published_indices:
+                segment["joint_published"] = True
+                segment["resolved"] = True
+    return {"project": updated, "batch": review_batch_summary(updated, batch_id), "report": report}
 
 
 def sample_local(project: dict[str, Any], time: float) -> dict[str, dict[str, float]]:

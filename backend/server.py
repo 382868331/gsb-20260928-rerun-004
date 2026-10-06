@@ -17,7 +17,9 @@ from animation_core import (
     default_project,
     evaluate_world,
     export_action,
+    joint_candidate_report,
     load_project,
+    publish_joint_candidate,
     publish_variant,
     review_batch_summary,
     sample_local,
@@ -191,6 +193,20 @@ class AnimationHandler(BaseHTTPRequestHandler):
                             project, str(payload["batch_id"]), str(payload["action_id"]),
                         )
                         self.end_json({"ok": True, "project": updated})
+                    elif op == "joint-report":
+                        report = joint_candidate_report(
+                            project,
+                            str(payload["batch_id"]),
+                            payload.get("selections", []),
+                        )
+                        self.end_json({"ok": True, "report": report})
+                    elif op == "joint-publish":
+                        result = publish_joint_candidate(
+                            project,
+                            str(payload["batch_id"]),
+                            payload.get("selections", []),
+                        )
+                        self.end_json({"ok": True, **result})
                     else:
                         self.end_json({"errors": [f"未知批次操作 {op}"]}, HTTPStatus.BAD_REQUEST)
                 except (KeyError, TypeError, ValueError, IndexError) as exc:
